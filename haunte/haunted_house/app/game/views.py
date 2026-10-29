@@ -125,6 +125,42 @@ def build_floor_state(
         "room": None,
     }
 
+    # ---- whole-game progress: fragments, the final door, the winner (all derived from the database)
+    floor_rows = {
+        r.floor_no: r
+        for r in db.scalars(
+            select(TeamFloorState).where(TeamFloorState.team_id == team.id).execution_options(populate_existing=True)
+        ).all()
+    }
+    fragments = []
+    for n in range(1, pr.TOTAL_FLOORS + 1):
+        row = floor_rows.get(n)
+        got = bool(row and row.fragment_awarded)
+        frag_preset = runtime.content.presets.get(row.preset_id) if (row and got) else None
+        fragments.append({
+            "floor": n, "collected": got,
+            "label": frag_preset["fragment"]["label"] if frag_preset else None,
+            "rune": frag_preset["fragment"].get("rune") if frag_preset else None,  # unknown until collected
+        })
+    all_collected = all(f["collected"] for f in fragments)
+    winner_team = db.get(Team, game.winner_team_id, populate_existing=True) if game.winner_team_id else None
+    state["game"] = {
+        "status": game.status, "total_floors": pr.TOTAL_FLOORS, "ended_at": _iso(game.ended_at),
+        "winner": {
+            "team_name": winner_team.name or f"Team {winner_team.slot_no}",
+            "is_my_team": winner_team.id == team.id,
+        } if winner_team else None,
+    }
+    state["fragments"] = fragments
+    state["final_door"] = {
+        "status": "OPENED" if team.status == TeamStatus.ESCAPED.value else (
+            "AVAILABLE" if (all_collected and game.status == GameStatus.RUNNING.value and not expired) else "LOCKED"),
+        "length": pr.TOTAL_FLOORS,
+        "collected": sum(1 for f in fragments if f["collected"]),
+        "runes": [f["rune"] for f in fragments],
+    }
+    state["can_advance"] = False
+
     floor = db.scalar(
         select(TeamFloorState)
         .where(TeamFloorState.team_id == team.id, TeamFloorState.floor_no == team.current_floor)
@@ -156,14 +192,29 @@ def build_floor_state(
         else:
             status = OBJ_AVAILABLE
         objects_out.append({
-            "id": oid, "type": obj["type"], "label": obj["label"], "icon": obj.get("icon", ""),
-            "x": obj["position"]["x"], "y": obj["position"]["y"], "optional": pr.is_optional(obj),
+            "id": oid, "type": "curio" if obj["type"] == "trap" else obj["type"], "label": obj["label"], "icon": obj.get("icon", ""),
+            "x": obj["position"]["x"], "y": obj["position"]["y"], "optional": pr.is_optional(obj) and obj["type"] != "trap",  # a trap looks like any other object
             "status": status,
             "holder": names.get(lease.player_id) if lease else None,
             "held_by_me": bool(lease and lease.player_id == player.id),
         })
 
     completed = floor.status == FloorStatus.COMPLETED.value
+    by_player = {l.player_id: l for l in leases.values()}
+    label_of = {o["id"]: o["label"] for o in preset["objects"]}
+    for member, entry in zip(members, state["members"]):
+        held = by_player.get(member.id)
+        entry["investigating"] = label_of.get(held.object_id) if held else None
+        entry["investigating_id"] = held.object_id if held else None
+    required = [o for o in preset["objects"] if not pr.is_optional(o)]
+    state["progress"] = {
+        "floor": floor.floor_no, "floors_completed": team.floors_completed, "total_floors": pr.TOTAL_FLOORS,
+        "required_total": len(required), "required_solved": sum(1 for o in required if o["id"] in solved),
+    }
+    state["can_advance"] = bool(
+        completed and floor.floor_no < pr.TOTAL_FLOORS and team.status == TeamStatus.PLAYING.value
+        and game.status == GameStatus.RUNNING.value and not expired
+    )
     vault_def = preset["vault"]
     vault_state = states.get(pr.VAULT_ID)
     pieces = floor.vault_pieces or {}
@@ -206,12 +257,17 @@ def build_floor_state(
     schedule = settings.hint_penalty_schedule
     revealed = []
     for h in used:
-        used_preset = runtime.content.presets.get(floor.preset_id)  # one floor today; per floor later
+        row = floor_rows.get(h.floor_no)
+        used_preset = runtime.content.presets.get(row.preset_id) if row else None  # the room the hint was about
         ladder = (used_preset.get("hints", {}).get(h.object_id or "") or []) if used_preset else []
-        label = vault_def["label"] if h.object_id == pr.VAULT_ID else next(
-            (o["label"] for o in preset["objects"] if o["id"] == h.object_id), "")
+        if used_preset is None:
+            label = ""
+        elif h.object_id == pr.VAULT_ID:
+            label = used_preset["vault"]["label"]
+        else:
+            label = next((o["label"] for o in used_preset["objects"] if o["id"] == h.object_id), "")
         revealed.append({
-            "level": h.hint_number, "penalty_seconds": h.penalty_seconds, "about": label,
+            "level": h.hint_number, "penalty_seconds": h.penalty_seconds, "about": label, "floor": h.floor_no,
             "text": ladder[h.hint_number - 1] if len(ladder) >= h.hint_number else "",
             "used_by": names.get(h.requested_by_player_id),
         })
@@ -225,7 +281,8 @@ def build_floor_state(
         ],
         "revealed": revealed,
         "total_penalty_seconds": team.hint_penalty_seconds,
-        "available": (not expired) and (not completed) and len(used) < settings.max_hints,
+        "available": (not expired) and (not completed) and game.status == GameStatus.RUNNING.value
+        and len(used) < settings.max_hints,
     }
 
     # ---- what THIS player is investigating (puzzle content goes to the holder only)
@@ -249,3 +306,42 @@ def build_floor_state(
             inv["dare"] = dare_engine.dare_public(chosen) if chosen else None
         state["my_investigation"] = inv
     return state
+
+
+def build_host_dashboard(db: Session, runtime: GameRuntime, game: Game, now: datetime | None = None) -> dict[str, Any]:
+    """The host's overview of every team (no puzzle content, no codes): where each team is and who won."""
+    now = now or utcnow()
+    teams = list(
+        db.scalars(select(Team).where(Team.game_id == game.id).order_by(Team.slot_no).execution_options(populate_existing=True)).all()
+    )
+    hint_counts = dict(
+        db.execute(select(HintUsage.team_id, func.count()).where(HintUsage.team_id.in_([t.id for t in teams])).group_by(HintUsage.team_id)).all()
+    ) if teams else {}
+    fragment_counts = dict(
+        db.execute(
+            select(TeamFloorState.team_id, func.count()).where(
+                TeamFloorState.team_id.in_([t.id for t in teams]), TeamFloorState.fragment_awarded.is_(True)
+            ).group_by(TeamFloorState.team_id)
+        ).all()
+    ) if teams else {}
+    members = dict(
+        db.execute(select(Player.team_id, func.count()).where(Player.game_id == game.id, Player.team_id.is_not(None)).group_by(Player.team_id)).all()
+    )
+    rows = []
+    for t in teams:
+        expired = t.status == TeamStatus.ELIMINATED.value or (
+            t.status == TeamStatus.PLAYING.value and t.deadline_at is not None and now >= t.deadline_at)
+        rows.append({
+            "team_id": t.id, "name": t.name or f"Team {t.slot_no}", "status": TeamStatus.ELIMINATED.value if expired else t.status,
+            "floor": t.current_floor, "floors_completed": t.floors_completed,
+            "fragments": fragment_counts.get(t.id, 0), "hints_used": hint_counts.get(t.id, 0),
+            "players": members.get(t.id, 0),
+            "seconds_remaining": seconds_remaining(t.deadline_at, now) if (t.deadline_at and not expired) else 0,
+            "finished_at": _iso(t.finished_at),
+        })
+    winner = next((r for r in rows if r["team_id"] == game.winner_team_id), None)
+    return {
+        "game_status": game.status, "server_now": _iso(now), "total_floors": pr.TOTAL_FLOORS,
+        "winner": {"team_name": winner["name"], "team_id": winner["team_id"]} if winner else None,
+        "teams": rows,
+    }

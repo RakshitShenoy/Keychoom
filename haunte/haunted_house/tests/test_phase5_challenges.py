@@ -22,7 +22,7 @@ def library() -> ContentLibrary:
 
 # ================================================================ pure engine tests
 def test_content_loads_and_validates(library):
-    assert set(library.puzzles) == {"f1_candle", "f1_painting", "f1_vent"}
+    assert {"f1_candle", "f1_painting", "f1_vent"} <= set(library.puzzles)  # Floor 1 + the Phase 7 floors
     assert "floor1_cellar" in library.presets and "core_reasoning" in library.quizzes
     assert validate_game_content(library) == []
 
@@ -75,10 +75,11 @@ def test_supported_answer_types_and_multistep():
 
 def test_public_view_never_contains_answers(library):
     for puzzle in library.puzzles.values():
-        view = challenge.public_view(puzzle, 0)
-        assert not {"answer", "answers", "wrong_feedback", "reveal_text"} & set(view)
-        if puzzle["answer_type"] == "numeric":
-            assert f'"{puzzle["answer"]}"' not in json.dumps(view)
+        for index, step in enumerate(challenge.steps_of(puzzle)):  # every step of every puzzle
+            view = challenge.public_view(puzzle, index)
+            assert not {"answer", "answers", "wrong_feedback", "reveal_text"} & set(view)
+            if step["answer_type"] == "numeric":
+                assert f'"{step["answer"]}"' not in json.dumps(view)
 
 
 def test_answers_are_not_in_any_served_file():

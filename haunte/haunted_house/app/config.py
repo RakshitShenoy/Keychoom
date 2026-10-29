@@ -64,6 +64,12 @@ class Settings(BaseSettings):
     answer_cooldown_seconds: float = Field(2.0, ge=0)  # pause after a wrong answer / wrong vault code
     sweeper_interval_seconds: float = Field(1.0, gt=0)  # lease expiry, team deadlines, quiz timeouts
 
+    # --- jumpscares (Phase 9) ----------------------------------------------------------------
+    jumpscares_enabled: bool = True
+    jumpscares_per_team: int = Field(3, ge=0, le=12)      # scheduled randomly over a whole game
+    jumpscare_cooldown_seconds: float = Field(90.0, ge=0)  # minimum gap between two scares of one team
+    jumpscare_display_ms: int = Field(5000, ge=1000, le=10000)
+
     # --- WebSocket layer (Phase 3) ---------------------------------------------------
     ws_snapshot_debounce_seconds: float = Field(0.05, ge=0)  # coalesces bursts of changes
     ws_max_message_bytes: int = Field(4096, ge=64)

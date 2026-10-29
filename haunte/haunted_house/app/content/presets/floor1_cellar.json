@@ -5,7 +5,8 @@
   "intro": "The cellar door slams shut behind you. A single black candle flickers on a table. Somewhere in this room is the key to the first vault.",
   "fragment": {
     "id": "fragment_1",
-    "label": "Floor 1 Key Fragment"
+    "label": "Floor 1 Key Fragment",
+    "rune": "W"
   },
   "vault": {
     "label": "Iron Vault",

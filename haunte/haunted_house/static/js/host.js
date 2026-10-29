@@ -87,6 +87,7 @@
       lobby.counts.min_total_players + "-" + lobby.counts.max_total_players + ", room for " +
       lobby.counts.capacity + ")";
 
+    if (lobby.game_status === "RUNNING" || lobby.game_status === "FINISHED") { watchDashboard(); }
     const a = lobby.host_actions;
     $("btn-start").disabled = !a.can_start_formation;
     $("btn-lock").disabled = !a.can_lock;
@@ -139,6 +140,49 @@
     if (res.ok) { render(res.data, false); }
   }
 
+
+  // ---- Phase 7: the host's game dashboard (team progress + winner). Server data only. ----
+  let dashTimer = null;
+  let dashBusy = false;
+  function fmtClock(sec) {
+    const s = Math.max(0, Math.floor(sec)), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+    const two = function (n) { return (n < 10 ? "0" : "") + n; };
+    return (h ? h + ":" + two(m) : m) + ":" + two(r);
+  }
+  async function loadDashboard() {
+    if (!gameCode || dashBusy) { return; }
+    dashBusy = true;
+    try {
+      const res = await HH.api(lobbyUrl("/play/host"));
+      if (res.ok) { renderDashboard(res.data); }
+    } finally { dashBusy = false; }
+  }
+  function renderDashboard(d) {
+    $("dash-card").classList.remove("hidden");
+    const box = $("dash-winner");
+    box.textContent = "";
+    if (d.winner) {
+      box.appendChild(el("div", { class: "hh-winner", id: "dash-winner-name", text: d.winner.team_name + " escaped first!" }));
+    } else if (d.game_status === "FINISHED") {
+      box.appendChild(el("div", { class: "hh-winner", text: "Time ran out. Nobody escaped." }));
+    }
+    const table = $("dash-teams");
+    table.textContent = "";
+    table.appendChild(el("tr", {}, ["Team", "Status", "Floor", "Fragments", "Hints", "Time left"].map(function (h) { return el("th", { text: h }); })));
+    d.teams.forEach(function (t) {
+      const left = d.game_status === "RUNNING" && t.status === "PLAYING" ? fmtClock(t.seconds_remaining) : "-";
+      table.appendChild(el("tr", { class: d.winner && d.winner.team_id === t.team_id ? "win" : "", "data-team": t.name }, [
+        el("td", { text: t.name }), el("td", { text: t.status }), el("td", { text: t.floor + "/" + d.total_floors }),
+        el("td", { text: t.fragments + "/" + d.total_floors }), el("td", { text: String(t.hints_used) }), el("td", { text: left })
+      ]));
+    });
+  }
+  function watchDashboard() {
+    if (dashTimer) { return; }
+    loadDashboard();
+    dashTimer = setInterval(loadDashboard, 3000);
+  }
+
   function start(code) {
     gameCode = code;
     if (rt) { rt.stop(); }
@@ -147,7 +191,10 @@
       role: "host",
       poll: poll,
       onState: function (state) { render(state, false); },
-      onEvent: function (type, payload) { HH.logActivity($("activity"), HH.describeEvent(type, payload)); },
+      onEvent: function (type, payload) {
+        HH.logActivity($("activity"), HH.describeEvent(type, payload));
+        if (type === "GAME_FINISHED" || type === "FLOOR_ENTERED" || type === "FINAL_DOOR_OPENED") { loadDashboard(); }
+      },
       onStatus: function (s) { HH.showConnectionStatus($("conn-status"), s); },
       onFatal: function () {
         $("action-error").textContent = "Your host session is no longer valid. Reload and create a new lobby.";

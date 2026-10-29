@@ -89,3 +89,99 @@ def reload(db, model, row_id):
 def quiz_answers() -> dict[str, str]:
     pool = json.loads((CONTENT_DIR / "quizzes" / "core_reasoning.json").read_text())
     return {q["id"]: q["answer"] for q in pool["questions"]}
+
+
+# ---------------------------------------------------------------------------------------------
+# Phase 7-9: a bot that climbs the whole building through the REAL gameplay API
+# ---------------------------------------------------------------------------------------------
+import shutil  # noqa: E402
+
+from app.content.loader import load_and_validate  # noqa: E402
+from app.engines import challenge as challenge_engine  # noqa: E402
+from app.game.presets import final_door_code, validate_building, validate_game_content  # noqa: E402
+
+
+def load_library(content_dir=CONTENT_DIR):
+    return load_and_validate(content_dir, extra_validators=[validate_game_content, validate_building])
+
+
+def preset_by_title(library, title):
+    return next(p for p in library.presets.values() if p["title"] == title)
+
+
+def content_variant(tmp_path, library, variant: int):
+    """A content directory where every floor offers exactly ONE room: the first (variant 0) or the
+    second (variant 1) preset of the floor. Playing both variants covers every shipped preset."""
+    dest = tmp_path / f"content_v{variant}"
+    shutil.copytree(CONTENT_DIR, dest)
+    for floor in range(1, 9):
+        rooms = sorted(p["id"] for p in library.presets.values() if p["floor"] == floor)
+        keep = rooms[min(variant, len(rooms) - 1)]
+        for room in rooms:
+            if room != keep:
+                (dest / "presets" / f"{room}.json").unlink()
+    return dest
+
+
+def topo_order(preset):
+    """Required objects in an order where every prerequisite comes first."""
+    done, order = set(), []
+    required = [o for o in preset["objects"] if o["type"] in ("puzzle", "quiz")]
+    while len(order) < len(required):
+        for obj in required:
+            if obj["id"] not in done and set(obj.get("requires", [])) <= done:
+                done.add(obj["id"])
+                order.append(obj)
+    return order
+
+
+def solve_object(player, obj, library):
+    assert player.investigate(obj["id"]).status_code == 200, obj["id"]
+    if obj["type"] == "puzzle":
+        puzzle = library.puzzles[obj["puzzle"]]
+        steps = challenge_engine.steps_of(puzzle)
+        for index, step in enumerate(steps):
+            response = player.answer(obj["id"], str(step["answer"]))
+            assert response.status_code == 200, response.text
+            expected = "CORRECT" if index == len(steps) - 1 else "PARTIAL"
+            assert response.json()["result"]["result"] == expected, (obj["id"], index, response.text)
+    else:  # quiz
+        pool = {q["id"]: q["answer"] for q in library.quizzes[obj["quiz"]["pool"]]["questions"]}
+        assert player.quiz_start(obj["id"]).status_code == 200
+        for _ in range(obj["quiz"]["questions"]):
+            question = player.state()["my_investigation"]["quiz"]["question"]
+            response = player.quiz_answer(obj["id"], question["question_id"], pool[question["question_id"]])
+            assert response.status_code == 200, response.text
+        assert response.json()["result"]["result"] == "FINISHED" and response.json()["result"]["passed"]
+
+
+def solve_floor(players, library, climb=True):
+    """Solve the team's current room completely (teammates take turns), open the vault and (optionally)
+    climb to the next floor. Returns the preset that was played."""
+    state = players[0].state()
+    preset = preset_by_title(library, state["room"]["title"])
+    for i, obj in enumerate(topo_order(preset)):
+        solve_object(players[i % len(players)], obj, library)
+    response = players[0].vault(preset["vault"]["code"])
+    assert response.status_code == 200 and response.json()["result"]["result"] == "CORRECT", response.text
+    if climb and preset["floor"] < 8:
+        response = players[1 % len(players)].call("POST", "/floor/next")
+        assert response.status_code == 200, response.text
+    return preset
+
+
+def climb_to_floor(players, library, target):
+    """Play every floor below ``target`` and stand at the start of floor ``target``."""
+    played = []
+    while players[0].state()["room"]["floor"] < target:
+        played.append(solve_floor(players, library))
+    return played
+
+
+def play_whole_building(players, library):
+    played = [solve_floor(players, library, climb=True) for _ in range(8)]
+    return {p["floor"]: p for p in played}
+
+
+def final_code(presets_by_floor):
+    return final_door_code(presets_by_floor)

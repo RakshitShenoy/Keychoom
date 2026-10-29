@@ -13,6 +13,7 @@ from app.auth.dependencies import require_host_of_game, require_player_of_game
 from app.db.models import Game, Player
 from app.db.session import get_db
 from app.game import service
+from app.game.views import build_host_dashboard
 from app.lobby.views import Viewer, build_lobby_view
 from app.schemas.lobby import LobbyResponse
 
@@ -40,6 +41,16 @@ class QuizAnswerRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     question_id: str = Field(max_length=64)
     choice: str = Field(max_length=16)
+
+
+class EmptyRequest(BaseModel):
+    """No fields: a browser cannot choose a floor or a fragment, so extra fields are rejected."""
+    model_config = ConfigDict(extra="forbid")
+
+
+class FinalDoorRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    code: str = Field(max_length=32)
 
 
 def _runtime(request: Request):
@@ -130,3 +141,26 @@ def hint(
     player: Player = Depends(require_player_of_game), db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     return service.use_hint(db, _runtime(request), player, payload.level)
+
+
+@router.post("/play/floor/next")
+def next_floor(
+    request: Request, payload: EmptyRequest | None = None,
+    player: Player = Depends(require_player_of_game), db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return service.advance_floor(db, _runtime(request), player)
+
+
+@router.post("/play/final-door")
+def final_door(
+    payload: FinalDoorRequest, request: Request,
+    player: Player = Depends(require_player_of_game), db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return service.open_final_door(db, _runtime(request), player, payload.code)
+
+
+@router.get("/play/host")
+def host_dashboard(
+    request: Request, game: Game = Depends(require_host_of_game), db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return build_host_dashboard(db, _runtime(request), game)

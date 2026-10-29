@@ -26,8 +26,9 @@ def test_host_session_persists_across_requests(client, make_game):
 
 def test_player_session_persists_and_identifies_game_and_team(client, make_game):
     game = make_game().json()
-    client.post("/api/games/join", json={"game_code": game["game_code"], "display_name": "Alice"})
-    me = client.get("/api/me").json()
+    browser = TestClient(client.app)  # a player's own browser: it holds no host cookie
+    browser.post("/api/games/join", json={"game_code": game["game_code"], "display_name": "Alice"})
+    me = browser.get("/api/me").json()
     assert me["player"]["display_name"] == "Alice"
     assert me["player"]["game_code"] == game["game_code"]
     assert me["player"]["team_id"] is None

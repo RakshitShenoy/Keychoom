@@ -31,6 +31,7 @@ from app.game import presets as pr
 from app.game.runtime import GameRuntime
 from app.game.views import active_quiz_attempt, build_floor_state, quiz_attempt_count
 from app.hints.penalties import penalty_for_hint
+from app.jumpscares import service as scares
 from app.lobby.events import LobbyEvent, LobbyEventBus, LobbyEventType, record_event
 from app.lobby.locks import game_lock
 from app.teams.queries import load_lobby_data
@@ -40,6 +41,8 @@ from app.timers.deadline import compute_team_deadline
 log = logging.getLogger(__name__)
 E = LobbyEventType
 FIRST_FLOOR = 1
+TOTAL_FLOORS = pr.TOTAL_FLOORS
+FINAL_DOOR_ID = "final_door"
 
 
 # =====================================================================================
@@ -111,9 +114,15 @@ def _load(db: Session, runtime: GameRuntime, player: Player, now: datetime) -> C
     )
     if game is None or team is None:
         raise AppError(404, "TEAM_NOT_FOUND", "Your team could not be found.")
+    _require_running(game)
+    return _build_ctx(db, runtime, game, team, now)
+
+
+def _require_running(game: Game) -> None:
+    if game.status == GameStatus.FINISHED.value:
+        raise AppError(409, "GAME_OVER", "The game is over.")
     if game.status != GameStatus.RUNNING.value:
         raise AppError(409, "GAME_NOT_RUNNING", "The game is not running.")
-    return _build_ctx(db, runtime, game, team, now)
 
 
 def _eliminate(db: Session, runtime: GameRuntime, ctx: Ctx) -> None:
@@ -126,12 +135,12 @@ def _eliminate(db: Session, runtime: GameRuntime, ctx: Ctx) -> None:
     _record(db, ctx, E.TEAM_ELIMINATED, {"team_name": ctx.team_name})
     db.commit()
     _publish(runtime, ctx)
+    _finish_if_nobody_left(db, runtime, ctx.game.id, ctx.now)
 
 
 def _ensure_playable(db: Session, runtime: GameRuntime, ctx: Ctx) -> None:
     """The server (never the browser) decides whether a team may still play."""
-    if ctx.game.status != GameStatus.RUNNING.value:
-        raise AppError(409, "GAME_NOT_RUNNING", "The game is not running.")
+    _require_running(ctx.game)
     team = ctx.team
     if team.status == TeamStatus.ELIMINATED.value:
         raise AppError(409, "TEAM_ELIMINATED", "Your team has run out of time.")
@@ -225,7 +234,7 @@ def start_game(db: Session, runtime: GameRuntime, game_id: str, now: datetime | 
         presets = pr.presets_for_floor(runtime.content, FIRST_FLOOR)
         if not presets:
             raise AppError(503, "CONTENT_MISSING", "No room is available for Floor 1.")
-        dealt = pr.assign_presets([p["id"] for p in presets], [t.id for t in data.teams], seed=game.id)
+        dealt = pr.assign_presets([p["id"] for p in presets], [t.id for t in data.teams], seed=f"{game.id}:floor{FIRST_FLOOR}")
 
         started = now or utcnow()
         game.status = GameStatus.RUNNING.value
@@ -240,6 +249,7 @@ def start_game(db: Session, runtime: GameRuntime, game_id: str, now: datetime | 
                 team_id=team.id, floor_no=FIRST_FLOOR, preset_id=dealt[team.id],
                 status=FloorStatus.ACTIVE.value, vault_pieces={}, fragment_awarded=False,
             ))
+            scares.plan_for_team(db, runtime.settings, game, team, started)
         event = record_event(db, game.id, E.GAME_STARTED, {})
         db.commit()
         team_ids = [t.id for t in data.teams]
@@ -284,6 +294,8 @@ def investigate(
     with runtime.team_lock(team_id):
         now = now or utcnow()
         ctx, obj = _object_ctx(db, runtime, player, object_id, now)
+        if obj["type"] == "trap":
+            return _spring_trap(db, runtime, ctx, obj, player)
         row = ctx.states.get(object_id)
         if row is not None and row.status == ObjectStatus.SOLVED.value:
             raise AppError(409, "OBJECT_SOLVED", "That has already been solved.")
@@ -314,6 +326,20 @@ def investigate(
             raise
         _publish(runtime, ctx)
         return _response(db, runtime, ctx, player)
+
+
+def _spring_trap(db: Session, runtime: GameRuntime, ctx: Ctx, obj: dict[str, Any], player: Player) -> dict[str, Any]:
+    """A trap object only ever produces a jumpscare for the player who touched it. It has no lease and
+    no object state: puzzle progress, vault, hints and timers are not read or written."""
+    event, payload = scares.trigger_trap(
+        db, runtime.settings, ctx.game, ctx.team, player.id, ctx.now, obj.get("scare")
+    )
+    if event is not None:
+        ctx.events.append(event)
+    db.commit()
+    _publish(runtime, ctx)
+    shown = {k: v for k, v in payload.items() if k != "only_player_id"} if payload else None
+    return _response(db, runtime, ctx, player, {"result": "TRAP", "message": obj["reward_text"], "jumpscare": shown})
 
 
 def _on_released(
@@ -473,6 +499,143 @@ def submit_vault(
         _publish(runtime, ctx)
         return _response(db, runtime, ctx, player, {
             "result": challenge.CORRECT, "message": f"The vault opens. You received the {fragment['label']}!"})
+
+
+# =====================================================================================
+# Phase 7: climbing to the next floor, the final door, the winner
+# =====================================================================================
+def _team_floor_rows(db: Session, team_id: str) -> dict[int, TeamFloorState]:
+    rows = db.scalars(
+        select(TeamFloorState).where(TeamFloorState.team_id == team_id).execution_options(populate_existing=True)
+    ).all()
+    return {r.floor_no: r for r in rows}
+
+
+def advance_floor(db: Session, runtime: GameRuntime, player: Player, now: datetime | None = None) -> dict[str, Any]:
+    """Move the team up one floor. Allowed ONLY when the team's current floor is COMPLETED (vault opened
+    and fragment awarded by the server). The next room is dealt by the server; floors cannot be skipped."""
+    team_id = _team_id(player)
+    with runtime.team_lock(team_id):
+        now = now or utcnow()
+        ctx = _load(db, runtime, player, now)
+        _ensure_playable(db, runtime, ctx)
+        floor = ctx.floor
+        if floor.status != FloorStatus.COMPLETED.value or not floor.fragment_awarded:
+            raise AppError(409, "FLOOR_NOT_COMPLETE", "Open this floor's vault before climbing higher.")
+        if floor.floor_no >= TOTAL_FLOORS:
+            raise AppError(409, "NO_NEXT_FLOOR", "This is the top floor. Only the final door is left.")
+        target = floor.floor_no + 1
+        presets = pr.presets_for_floor(runtime.content, target)
+        if not presets:
+            raise AppError(503, "CONTENT_MISSING", f"No room is available for Floor {target}.")
+        team_ids = list(db.scalars(select(Team.id).where(Team.game_id == ctx.game.id)).all())
+        dealt = pr.assign_presets([p["id"] for p in presets], team_ids, seed=f"{ctx.game.id}:floor{target}")
+        db.add(TeamFloorState(
+            team_id=ctx.team.id, floor_no=target, preset_id=dealt[ctx.team.id],
+            status=FloorStatus.ACTIVE.value, vault_pieces={}, fragment_awarded=False,
+        ))
+        ctx.team.current_floor = target
+        runtime.leases.clear_team(ctx.team.id)
+        title = runtime.content.presets[dealt[ctx.team.id]]["title"]
+        try:
+            db.flush()
+        except IntegrityError:  # a double click: the (team, floor) unique key already has this floor
+            db.rollback()
+            raise AppError(409, "FLOOR_NOT_COMPLETE", "Your team is already on that floor.") from None
+        ctx.floor = db.scalar(
+            select(TeamFloorState).where(TeamFloorState.team_id == ctx.team.id, TeamFloorState.floor_no == target)
+        )
+        _record(db, ctx, E.FLOOR_ENTERED, {"floor": target, "title": title, "display_name": player.display_name})
+        db.commit()
+        _publish(runtime, ctx)
+        return _response(db, runtime, ctx, player, {"result": "ENTERED", "floor": target, "message": f"Floor {target}: {title}"})
+
+
+def _collected_presets(runtime: GameRuntime, rows: dict[int, TeamFloorState]) -> dict[int, dict[str, Any]] | None:
+    """The preset of every floor 1..8 the team has COMPLETED with an awarded fragment (else None)."""
+    out: dict[int, dict[str, Any]] = {}
+    for floor in range(1, TOTAL_FLOORS + 1):
+        row = rows.get(floor)
+        if row is None or row.status != FloorStatus.COMPLETED.value or not row.fragment_awarded:
+            return None
+        preset = runtime.content.presets.get(row.preset_id)
+        if preset is None or preset["floor"] != floor:
+            return None
+        out[floor] = preset
+    if len({p["fragment"]["id"] for p in out.values()}) != TOTAL_FLOORS:
+        return None
+    return out
+
+
+def open_final_door(
+    db: Session, runtime: GameRuntime, player: Player, code: str, now: datetime | None = None
+) -> dict[str, Any]:
+    """The first team to open the final door wins. The door needs ALL 8 awarded fragments (read from the
+    database, never from the browser) and the 8-rune code they spell. The winner is decided under a
+    per-game lock, so two teams reaching the door at the same instant produce exactly one winner."""
+    team_id = _team_id(player)
+    with runtime.team_lock(team_id):
+        now = now or utcnow()
+        ctx = _load(db, runtime, player, now)
+        _ensure_playable(db, runtime, ctx)
+        presets = _collected_presets(runtime, _team_floor_rows(db, ctx.team.id))
+        if presets is None:
+            raise AppError(409, "FINAL_DOOR_LOCKED", "The final door needs the key fragments of all 8 floors.")
+        _check_cooldown(runtime, ctx, FINAL_DOOR_ID)
+        guess = challenge.normalize_code(code if isinstance(code, str) else "")
+        expected = pr.final_door_code(presets)
+        if len(guess) != TOTAL_FLOORS:
+            return _response(db, runtime, ctx, player, {
+                "result": challenge.INVALID, "message": f"The final door takes {TOTAL_FLOORS} runes."})
+        if guess != expected:
+            runtime.start_cooldown(ctx.team.id, FINAL_DOOR_ID, now)
+            _record(db, ctx, E.ANSWER_WRONG, {"object_id": FINAL_DOOR_ID, "display_name": player.display_name, "attempts": 1})
+            db.commit()
+            _publish(runtime, ctx)
+            return _response(db, runtime, ctx, player, {
+                "result": challenge.WRONG, "message": "The runes flare red and fade. That is not the right order."})
+
+        with game_lock:  # ---- exactly one winner per game
+            game = db.scalar(select(Game).where(Game.id == ctx.game.id).execution_options(populate_existing=True))
+            if game is None or game.status != GameStatus.RUNNING.value:
+                raise AppError(409, "GAME_OVER", "Another team has already escaped.")
+            team = ctx.team
+            ctx.game = game
+            game.status = GameStatus.FINISHED.value
+            game.winner_team_id = team.id
+            game.ended_at = now
+            team.status = TeamStatus.ESCAPED.value
+            team.finished_at = now
+            runtime.leases.clear_team(team.id)
+            _record(db, ctx, E.FINAL_DOOR_OPENED, {"display_name": player.display_name, "team_name": ctx.team_name})
+            finished = record_event(db, game.id, E.GAME_FINISHED, {
+                "winner_team_name": ctx.team_name, "finished_at": now.isoformat(),
+            })
+            db.commit()
+            other_team_ids = list(db.scalars(select(Team.id).where(Team.game_id == game.id, Team.id != team.id)).all())
+        _publish(runtime, ctx)
+        runtime.bus.publish_change(finished)  # EVERY connected team and the host hear the winner now
+        for other in other_team_ids:
+            runtime.bus.publish(LobbyEvent(E.FLOOR_UPDATED, game.id, {}, other))
+        return _response(db, runtime, ctx, player, {
+            "result": challenge.CORRECT, "message": "The final door swings open. Your team escaped first!"})
+
+
+def _finish_if_nobody_left(db: Session, runtime: GameRuntime, game_id: str, now: datetime) -> bool:
+    """When every team has run out of time and nobody escaped, the game ends without a winner."""
+    with game_lock:
+        game = db.scalar(select(Game).where(Game.id == game_id).execution_options(populate_existing=True))
+        if game is None or game.status != GameStatus.RUNNING.value:
+            return False
+        statuses = db.scalars(select(Team.status).where(Team.game_id == game_id)).all()
+        if any(st != TeamStatus.ELIMINATED.value for st in statuses):
+            return False
+        game.status = GameStatus.FINISHED.value
+        game.ended_at = now
+        finished = record_event(db, game.id, E.GAME_FINISHED, {"winner_team_name": None, "finished_at": now.isoformat()})
+        db.commit()
+    runtime.bus.publish_change(finished)
+    return True
 
 
 # =====================================================================================
@@ -764,6 +927,7 @@ def sweep(
         released = _sweep_leases(db, runtime, now)
         quizzes = _sweep_quizzes(db, runtime, now)
         eliminated = eliminate_overdue_teams(db, runtime, now)
-        return {"released": released, "quizzes": quizzes, "eliminated": eliminated}
+        jumpscares = scares.fire_due(db, runtime, now)
+        return {"released": released, "quizzes": quizzes, "eliminated": eliminated, "jumpscares": jumpscares}
     finally:
         db.close()

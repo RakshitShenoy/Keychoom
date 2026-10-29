@@ -119,8 +119,14 @@
       poll: poll,
       onState: function (state) { render(state, false); },
       onFloorState: function (floor) { if (HH.game) { HH.game.update(floor); } },
-      onEvent: function (type, payload) { HH.logActivity($("activity"), HH.describeEvent(type, payload)); },
-      onStatus: function (s) { HH.showConnectionStatus($("conn-status"), s); },
+      onEvent: function (type, payload) {
+        HH.logActivity($("activity"), HH.describeEvent(type, payload));
+        if (HH.game && HH.game.event) { HH.game.event(type, payload); }
+      },
+      onStatus: function (s) {
+        HH.showConnectionStatus($("conn-status"), s);
+        if (HH.game && HH.game.setConnection) { HH.game.setConnection(s); }
+      },
       onFatal: function (code2, message) {
         backToJoin(code2 === "KICKED" ? message : "You are no longer in that game. Join again with a Game Code.");
       }

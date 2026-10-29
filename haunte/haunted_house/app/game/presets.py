@@ -24,7 +24,8 @@ from typing import Any, Iterable, Mapping
 from app.content.loader import ContentLibrary
 from app.engines import challenge, dare, quiz
 
-OBJECT_TYPES = ("puzzle", "quiz", "dare")
+OBJECT_TYPES = ("puzzle", "quiz", "dare", "trap")
+TOTAL_FLOORS = 8
 VAULT_ID = "vault"
 HINT_LEVELS = 4
 VAULT_LENGTH = 4
@@ -41,7 +42,7 @@ def objects_by_id(preset: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def is_optional(obj: Mapping[str, Any]) -> bool:
-    return bool(obj.get("optional")) or obj.get("type") == "dare"
+    return bool(obj.get("optional")) or obj.get("type") in ("dare", "trap")
 
 
 def prerequisites_met(obj: Mapping[str, Any], solved: Iterable[str]) -> bool:
@@ -60,6 +61,15 @@ def current_objective(preset: Mapping[str, Any], solved: Iterable[str]) -> str |
         if obj["id"] not in solved and not is_optional(obj) and prerequisites_met(obj, solved):
             return obj["id"]
     return VAULT_ID if vault_unlocked(preset, solved) else None
+
+
+def fragment_id_for(floor: int) -> str:
+    return f"fragment_{floor}"
+
+
+def final_door_code(presets_by_floor: Mapping[int, Mapping[str, Any]]) -> str:
+    """The 8-rune code of a team's final door: one rune per floor, from the presets it really played."""
+    return "".join(str(presets_by_floor[f]["fragment"]["rune"]) for f in range(1, TOTAL_FLOORS + 1))
 
 
 def vault_chars_for(preset: Mapping[str, Any], obj: Mapping[str, Any]) -> dict[str, str]:
@@ -128,6 +138,12 @@ def _validate_preset(library: ContentLibrary, preset: Mapping[str, Any]) -> list
     fragment = preset.get("fragment")
     if not isinstance(fragment, dict) or not fragment.get("id") or not fragment.get("label"):
         errors.append(f"preset {pid}: 'fragment' needs an id and a label")
+    else:
+        if floor and fragment.get("id") != fragment_id_for(floor):
+            errors.append(f"preset {pid}: the fragment id must be '{fragment_id_for(floor)}' (one unique fragment per floor)")
+        rune = fragment.get("rune")
+        if not (isinstance(rune, str) and len(rune) == 1 and rune in _CODE_CHARS):
+            errors.append(f"preset {pid}: the fragment needs a 'rune' (one upper-case letter or digit)")
 
     vault = preset.get("vault")
     objects = preset.get("objects")
@@ -202,6 +218,13 @@ def _validate_preset(library: ContentLibrary, preset: Mapping[str, Any]) -> list
                     errors.append(f"{label}: quiz 'pass_score' must be between 1 and 'questions'")
                 if not (isinstance(limit, int) and 10 <= limit <= 900):
                     errors.append(f"{label}: quiz 'time_limit_seconds' must be between 10 and 900")
+        elif kind == "trap":
+            if o.get("vault_positions"):
+                errors.append(f"{label}: a trap must not own vault characters")
+            if deps:
+                errors.append(f"{label}: a trap cannot require other objects")
+            if o.get("scare") is not None and not isinstance(o.get("scare"), str):
+                errors.append(f"{label}: 'scare' must be an asset id")
         elif kind == "dare":
             if library.dares.get(o.get("dare_pool")) is None:
                 errors.append(f"{label}: unknown dare pool {o.get('dare_pool')!r}")
@@ -245,7 +268,8 @@ def _validate_preset(library: ContentLibrary, preset: Mapping[str, Any]) -> list
             errors.append(f"preset {pid}: optional object {oid} owns a vault position")
 
     hints = preset.get("hints")
-    for key in [*ids, VAULT_ID]:
+    trap_ids = {o["id"] for o in objects if isinstance(o, dict) and o.get("type") == "trap"}
+    for key in [*[i for i in ids if i not in trap_ids], VAULT_ID]:
         ladder = hints.get(key) if isinstance(hints, dict) else None
         if not (isinstance(ladder, list) and len(ladder) == HINT_LEVELS
                 and all(isinstance(h, str) and h.strip() for h in ladder)):
@@ -253,9 +277,36 @@ def _validate_preset(library: ContentLibrary, preset: Mapping[str, Any]) -> list
     return errors
 
 
+def _validate_fragments(library: ContentLibrary) -> list[str]:
+    """Cross-preset rules: every preset of a floor yields the SAME unique fragment/rune for that floor,
+    and no two floors share a rune (so the final door's 8-rune code is unambiguous)."""
+    errors: list[str] = []
+    rune_of_floor: dict[int, set[str]] = {}
+    for preset in library.presets.values():
+        floor, frag = preset.get("floor"), preset.get("fragment")
+        if isinstance(floor, int) and isinstance(frag, dict) and isinstance(frag.get("rune"), str):
+            rune_of_floor.setdefault(floor, set()).add(frag["rune"])
+    for floor, runes in rune_of_floor.items():
+        if len(runes) > 1:
+            errors.append(f"floor {floor}: its presets must all use the same fragment rune (found {sorted(runes)})")
+    singles = [next(iter(r)) for r in rune_of_floor.values() if len(r) == 1]
+    if len(set(singles)) != len(singles):
+        errors.append("two floors use the same fragment rune")
+    return errors
+
+
+def validate_building(library: ContentLibrary) -> list[str]:
+    """The finished game needs every one of the 8 floors (used at startup and by tools/validate_content.py)."""
+    errors = []
+    for floor in range(1, TOTAL_FLOORS + 1):
+        if not presets_for_floor(library, floor):
+            errors.append(f"floor {floor} has no room preset")
+    return errors
+
+
 def validate_game_content(library: ContentLibrary) -> list[str]:
     """Registered with the loader: an invalid library stops the application from starting."""
-    errors: list[str] = []
+    errors: list[str] = _validate_fragments(library)
     for puzzle in library.puzzles.values():
         errors.extend(challenge.validate_puzzle(puzzle))
     for pool_id, pool in library.quizzes.items():

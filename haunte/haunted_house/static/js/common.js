@@ -1,4 +1,11 @@
 /* Shared helpers for the development pages. All text is inserted with textContent (no innerHTML). */
+(function () {
+  // A new value on EVERY real page load. After a refresh it changes; a frozen page keeps the old one.
+  const id = Math.random().toString(36).slice(2, 10) + "-" + Date.now().toString(36);
+  window.__hhPageLoadId = id;
+  document.documentElement.setAttribute("data-page-load", id);
+})();
+
 window.HH = (function () {
   async function api(path, method, body) {
     const options = { method: method || "GET", headers: {}, credentials: "same-origin" };

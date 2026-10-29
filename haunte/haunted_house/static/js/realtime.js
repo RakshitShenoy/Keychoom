@@ -156,6 +156,10 @@
       case "DARE_CONFIRMED": return who + " completed a dare";
       case "HINT_USED": return who + " used hint " + p.level + " (-" + p.penalty_seconds + "s)";
       case "TEAM_ELIMINATED": return "Time is up for " + (p.team_name || "a team");
+      case "FLOOR_ENTERED": return who + " led " + team + " up to floor " + (p.floor || "?");
+      case "FINAL_DOOR_OPENED": return team + " opened the final door!";
+      case "GAME_FINISHED": return p.winner_team_name ? p.winner_team_name + " escaped first!" : "Time ran out for every team";
+      case "JUMPSCARE": return null;      // shown as an overlay by the game view
       case "CHAT_MESSAGE": return null;   // shown in the chat box itself
       default: return null;               // TEAM_UPDATED / LOBBY_UPDATED: state already re-rendered
     }

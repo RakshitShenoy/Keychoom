@@ -126,7 +126,9 @@ async def _heartbeat(conn: Connection, settings) -> None:
         await asyncio.sleep(settings.ws_heartbeat_interval_seconds)
         if time.monotonic() - conn.last_seen > settings.ws_heartbeat_timeout_seconds:
             conn.close(CLOSE_HEARTBEAT, error_message("HEARTBEAT_TIMEOUT", "Connection timed out."))
-            return
+            # Do NOT return: the writer must first deliver the ERROR and close the socket.
+            # Returning here would end asyncio.wait(FIRST_COMPLETED) and cancel the writer early.
+            await asyncio.Event().wait()
         conn.send(ping_message())
 
 
@@ -177,21 +179,21 @@ async def game_socket(websocket: WebSocket, game_code: str) -> None:
     except Exception:
         log.exception("websocket handler failed")  # details stay in the server log only
     finally:
-        conn.closed = True
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        last_for_player = hub.manager.remove(conn)
-        if last_for_player and identity.player_id:
-            with anyio.CancelScope(shield=True):
+        # The whole clean-up is shielded: even if this handler is being cancelled (server shutdown,
+        # a dropped connection torn down by the ASGI server) the presence flag must still be updated.
+        with anyio.CancelScope(shield=True):
+            conn.closed = True
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            last_for_player = hub.manager.remove(conn)
+            if last_for_player and identity.player_id:
                 try:
-                    await run_in_threadpool(
-                        hub.set_presence, identity.game_id, identity.player_id, False
-                    )
+                    await run_in_threadpool(hub.set_presence, identity.game_id, identity.player_id, False)
                 except Exception:
                     log.exception("presence update failed")
-        try:
-            await websocket.close()
-        except Exception:
-            pass
+            try:
+                await websocket.close()
+            except Exception:
+                pass

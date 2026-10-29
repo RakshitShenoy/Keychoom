@@ -17,7 +17,7 @@ from app.content.loader import load_and_validate
 from app.db.session import Database
 from app.error_handlers import register_error_handlers
 from app.game import service as game_service
-from app.game.presets import validate_game_content
+from app.game.presets import validate_building, validate_game_content
 from app.game.router import router as game_router
 from app.game.runtime import GameRuntime
 from app.host.router import router as host_router
@@ -53,7 +53,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         # Invalid game content must stop the server from starting.
         app.state.content = load_and_validate(
-            settings.content_dir, extra_validators=[validate_game_content]
+            settings.content_dir, extra_validators=[validate_game_content, validate_building]
         )
         app.state.realtime.start()
         try:

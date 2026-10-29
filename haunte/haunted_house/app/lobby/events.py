@@ -53,6 +53,13 @@ class LobbyEventType(str, Enum):
     DARE_CONFIRMED = "DARE_CONFIRMED"
     HINT_USED = "HINT_USED"
     TEAM_ELIMINATED = "TEAM_ELIMINATED"
+    # --- Phase 7-9. FLOOR_ENTERED / FINAL_DOOR_OPENED / JUMPSCARE / TRAP_TRIGGERED are team-scoped;
+    #     GAME_FINISHED is game-wide (every team and the host hear the winner at once).
+    FLOOR_ENTERED = "FLOOR_ENTERED"
+    FINAL_DOOR_OPENED = "FINAL_DOOR_OPENED"
+    GAME_FINISHED = "GAME_FINISHED"
+    JUMPSCARE = "JUMPSCARE"
+    TRAP_TRIGGERED = "TRAP_TRIGGERED"
 
 
 @dataclass(frozen=True)

@@ -80,4 +80,5 @@ def test_extra_validators_argument(content_dir):
 def test_shipped_content_directory_is_valid():
     from app.config import APP_DIR
 
-    assert load_and_validate(APP_DIR / "content").is_empty()
+    library = load_and_validate(APP_DIR / "content")  # raises if any shipped content is invalid
+    assert not library.is_empty()

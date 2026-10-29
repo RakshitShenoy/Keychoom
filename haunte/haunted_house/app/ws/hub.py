@@ -252,6 +252,19 @@ class RealtimeHub:
 
     def _on_team_event(self, event: LobbyEvent) -> None:
         """Gameplay events reach the host and the ONE team they belong to; nobody else."""
+        if event.type is LobbyEventType.JUMPSCARE:
+            # Presentation only: delivered to the team (or to the ONE player who sprang a trap) and the
+            # host's feed; it never triggers a state push because it changes no state.
+            only = event.payload.get("only_player_id")
+            body = {k: v for k, v in event.payload.items() if k != "only_player_id"}
+            self.manager.send_game(
+                event.game_id, event_message(event.type.value, {**body, "team_id": event.team_id}), role="host"
+            )
+            if only:
+                self.manager.send_player(event.game_id, only, event_message(event.type.value, body))
+            else:
+                self.manager.send_team(event.game_id, event.team_id, event_message(event.type.value, body))
+            return
         if event.type is not LobbyEventType.FLOOR_UPDATED:
             name = event.type.value
             self.manager.send_game(
