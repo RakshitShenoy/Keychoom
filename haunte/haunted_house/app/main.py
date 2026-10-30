@@ -70,7 +70,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="Escape the Haunted House", version="0.1.0-phase1", lifespan=lifespan)
     app.state.settings = settings
-    app.state.db = Database(settings.database_url)
+    app.state.db = Database(
+        settings.database_url, pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow, pool_timeout=settings.db_pool_timeout_seconds)
     app.state.templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     app.state.join_failure_limiter = FailureLimiter(
         settings.join_failure_limit, settings.join_failure_window_seconds

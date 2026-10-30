@@ -29,7 +29,8 @@ def create_game_endpoint(
     settings = request.app.state.settings
     game, host_token = create_game(db, settings, payload)
     set_session_cookie(
-        response, settings, settings.host_cookie_name, host_token, settings.host_session_ttl_seconds
+        response, settings, settings.host_cookie_name, host_token, settings.host_session_ttl_seconds,
+        request_is_https=request.url.scheme == "https",
     )
     return GameCreateResponse(
         game_id=game.id,
@@ -64,7 +65,8 @@ def join_game_endpoint(
         raise
 
     set_session_cookie(
-        response, settings, settings.player_cookie_name, token, settings.player_session_ttl_seconds
+        response, settings, settings.player_cookie_name, token, settings.player_session_ttl_seconds,
+        request_is_https=request.url.scheme == "https",
     )
     request.app.state.lobby_bus.publish_change(
         LobbyEvent(

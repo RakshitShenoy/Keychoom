@@ -97,8 +97,30 @@ class LeaseRegistry:
             keys = [k for k in self._leases if k[0] == team_id]
             return [self._leases.pop(k) for k in keys]
 
-    def expire(self, now: datetime) -> list[Lease]:
-        """Remove and return every lease that has run out."""
+    def expire(self, now: datetime, skip_teams: frozenset[str] | set[str] = frozenset()) -> list[Lease]:
+        """Remove and return every lease that has run out (teams in ``skip_teams`` are paused)."""
         with self._lock:
-            dead = [k for k, lease in self._leases.items() if lease.expires_at <= now]
+            dead = [
+                k for k, lease in self._leases.items()
+                if lease.expires_at <= now and lease.team_id not in skip_teams
+            ]
             return [self._leases.pop(k) for k in dead]
+
+    def release_player(self, player_id: str) -> list[Lease]:
+        """Drop every lease a player holds (the host removed them from the game)."""
+        with self._lock:
+            keys = [k for k, lease in self._leases.items() if lease.player_id == player_id]
+            return [self._leases.pop(k) for k in keys]
+
+    def shift_teams(self, team_ids: set[str] | frozenset[str], delta: timedelta) -> int:
+        """After a pause: push the expiry of these teams' leases forward by the pause length."""
+        with self._lock:
+            count = 0
+            for key, lease in list(self._leases.items()):
+                if lease.team_id in team_ids:
+                    self._leases[key] = Lease(
+                        lease.team_id, lease.floor_no, lease.object_id, lease.player_id,
+                        lease.acquired_at, lease.expires_at + delta,
+                    )
+                    count += 1
+            return count

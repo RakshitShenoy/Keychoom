@@ -7,14 +7,16 @@ Everything shown or enabled in the UI is decided here, on the server. Secrets ne
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db.enums import FloorStatus, GameStatus, ObjectStatus, TeamStatus
-from app.db.models import Game, HintUsage, ObjectState, Player, QuizAttempt, Team, TeamFloorState
+from app.db.models import (
+    Game, GameEvent, HintUsage, ObjectState, Player, QuizAttempt, Team, TeamFloorState,
+)
 from app.engines import challenge
 from app.engines import dare as dare_engine
 from app.engines import quiz as quiz_engine
@@ -22,7 +24,7 @@ from app.game import presets as pr
 from app.game.runtime import GameRuntime
 from app.hints.penalties import penalty_for_hint
 from app.timers.clock import utcnow
-from app.timers.deadline import seconds_remaining
+from app.timers.deadline import frozen_now, seconds_remaining
 
 OBJ_AVAILABLE, OBJ_BUSY, OBJ_SOLVED, OBJ_LOCKED = "AVAILABLE", "BEING_INVESTIGATED", "SOLVED", "LOCKED"
 
@@ -83,7 +85,9 @@ def build_floor_state(
     """The personal floor state of ``player`` (None when they are not on a team)."""
     if player.team_id is None:
         return None
-    now = now or utcnow()
+    real_now = now or utcnow()
+    now = frozen_now(game, real_now)  # while the host has paused, every clock stands still
+    paused = game.paused_at is not None
     settings = runtime.settings
     team = db.scalar(select(Team).where(Team.id == player.team_id).execution_options(populate_existing=True))
     if team is None or team.game_id != game.id:
@@ -103,6 +107,7 @@ def build_floor_state(
     )
     state: dict[str, Any] = {
         "game_status": game.status,
+        "paused": paused,
         "team": {
             "name": team.name or f"Team {team.slot_no}",
             "status": TeamStatus.ELIMINATED.value if expired else team.status,
@@ -116,7 +121,8 @@ def build_floor_state(
         ],
         "timer": {
             "deadline_at": _iso(team.deadline_at),
-            "server_now": _iso(now),
+            "server_now": _iso(real_now),
+            "paused": paused,
             "base_duration_seconds": game.base_duration_seconds,
             "penalty_seconds": team.hint_penalty_seconds,
             "seconds_remaining": seconds_remaining(team.deadline_at, now) if team.deadline_at else None,
@@ -145,7 +151,7 @@ def build_floor_state(
     all_collected = all(f["collected"] for f in fragments)
     winner_team = db.get(Team, game.winner_team_id, populate_existing=True) if game.winner_team_id else None
     state["game"] = {
-        "status": game.status, "total_floors": pr.TOTAL_FLOORS, "ended_at": _iso(game.ended_at),
+        "status": game.status, "paused": paused, "total_floors": pr.TOTAL_FLOORS, "ended_at": _iso(game.ended_at),
         "winner": {
             "team_name": winner_team.name or f"Team {winner_team.slot_no}",
             "is_my_team": winner_team.id == team.id,
@@ -154,7 +160,7 @@ def build_floor_state(
     state["fragments"] = fragments
     state["final_door"] = {
         "status": "OPENED" if team.status == TeamStatus.ESCAPED.value else (
-            "AVAILABLE" if (all_collected and game.status == GameStatus.RUNNING.value and not expired) else "LOCKED"),
+            "AVAILABLE" if (all_collected and game.status == GameStatus.RUNNING.value and not expired and not paused) else "LOCKED"),
         "length": pr.TOTAL_FLOORS,
         "collected": sum(1 for f in fragments if f["collected"]),
         "runes": [f["rune"] for f in fragments],
@@ -213,7 +219,7 @@ def build_floor_state(
     }
     state["can_advance"] = bool(
         completed and floor.floor_no < pr.TOTAL_FLOORS and team.status == TeamStatus.PLAYING.value
-        and game.status == GameStatus.RUNNING.value and not expired
+        and game.status == GameStatus.RUNNING.value and not expired and not paused
     )
     vault_def = preset["vault"]
     vault_state = states.get(pr.VAULT_ID)
@@ -282,7 +288,7 @@ def build_floor_state(
         "revealed": revealed,
         "total_penalty_seconds": team.hint_penalty_seconds,
         "available": (not expired) and (not completed) and game.status == GameStatus.RUNNING.value
-        and len(used) < settings.max_hints,
+        and not paused and len(used) < settings.max_hints,
     }
 
     # ---- what THIS player is investigating (puzzle content goes to the holder only)
@@ -305,43 +311,151 @@ def build_floor_state(
             chosen = next((d for d in pool if str(d["id"]) == dare_id), None)
             inv["dare"] = dare_engine.dare_public(chosen) if chosen else None
         state["my_investigation"] = inv
+    db.commit()  # reads are done: hand the connection back now
     return state
 
 
+_FEED_KEYS = ("display_name", "label", "floor", "title", "level", "team_name", "score", "total", "passed", "paused_seconds")
+_FEED_TEXT = {
+    "GAME_STARTED": "The game started", "GAME_PAUSED": "The game was paused", "GAME_RESUMED": "The game resumed",
+    "GAME_FINISHED": "The game ended", "FLOOR_ENTERED": "entered a new floor", "OBJECT_SOLVED": "solved an object",
+    "VAULT_OPENED": "opened the vault", "FRAGMENT_AWARDED": "collected a key fragment",
+    "FLOOR_COMPLETED": "completed the floor", "HINT_USED": "used a hint", "TEAM_ELIMINATED": "ran out of time",
+    "FINAL_DOOR_OPENED": "opened the final door", "PLAYER_KICKED": "was removed by the host",
+    "OBJECT_LOCKED": "started investigating", "TRAP_TRIGGERED": "set off a trap", "JUMPSCARE": "was scared",
+    "QUIZ_FINISHED": "finished a quiz", "DARE_CONFIRMED": "completed a dare",
+}
+
+
+def _clean_name(team: Team | None) -> str | None:
+    return (team.name or f"Team {team.slot_no}") if team else None
+
+
 def build_host_dashboard(db: Session, runtime: GameRuntime, game: Game, now: datetime | None = None) -> dict[str, Any]:
-    """The host's overview of every team (no puzzle content, no codes): where each team is and who won."""
-    now = now or utcnow()
+    """Everything the host needs to follow the whole game without entering a team's screen.
+
+    Host-only (the routes and the WebSocket check the host session). It never contains puzzle answers,
+    vault codes, rune values, or the text of hints: only where each team is and how it is doing."""
+    real_now = now or utcnow()
+    now = frozen_now(game, real_now)
+    paused = game.paused_at is not None
+    paused_total = int(game.paused_seconds_total or 0)
+    started = game.started_at
     teams = list(
         db.scalars(select(Team).where(Team.game_id == game.id).order_by(Team.slot_no).execution_options(populate_existing=True)).all()
     )
+    team_ids = [t.id for t in teams]
+    players = list(db.scalars(
+        select(Player).where(Player.game_id == game.id).order_by(Player.joined_at, Player.id).execution_options(populate_existing=True)
+    ).all())
+    by_team: dict[str, list[Player]] = {t.id: [] for t in teams}
+    for p in players:
+        if p.team_id in by_team:
+            by_team[p.team_id].append(p)
     hint_counts = dict(
-        db.execute(select(HintUsage.team_id, func.count()).where(HintUsage.team_id.in_([t.id for t in teams])).group_by(HintUsage.team_id)).all()
+        db.execute(select(HintUsage.team_id, func.count()).where(HintUsage.team_id.in_(team_ids)).group_by(HintUsage.team_id)).all()
     ) if teams else {}
-    fragment_counts = dict(
-        db.execute(
-            select(TeamFloorState.team_id, func.count()).where(
-                TeamFloorState.team_id.in_([t.id for t in teams]), TeamFloorState.fragment_awarded.is_(True)
-            ).group_by(TeamFloorState.team_id)
-        ).all()
-    ) if teams else {}
-    members = dict(
-        db.execute(select(Player.team_id, func.count()).where(Player.game_id == game.id, Player.team_id.is_not(None)).group_by(Player.team_id)).all()
-    )
+    floor_rows: dict[str, dict[int, TeamFloorState]] = {t.id: {} for t in teams}
+    if teams:
+        for r in db.scalars(select(TeamFloorState).where(TeamFloorState.team_id.in_(team_ids)).execution_options(populate_existing=True)).all():
+            floor_rows[r.team_id][r.floor_no] = r
+    solved_rows: dict[tuple[str, int], set[str]] = {}
+    if teams:
+        for r in db.scalars(select(ObjectState).where(
+            ObjectState.team_id.in_(team_ids), ObjectState.status == ObjectStatus.SOLVED.value
+        ).execution_options(populate_existing=True)).all():
+            solved_rows.setdefault((r.team_id, r.floor_no), set()).add(r.object_id)
+
+    max_hints = runtime.settings.max_hints
     rows = []
     for t in teams:
-        expired = t.status == TeamStatus.ELIMINATED.value or (
-            t.status == TeamStatus.PLAYING.value and t.deadline_at is not None and now >= t.deadline_at)
+        status = t.status
+        expired = status == TeamStatus.ELIMINATED.value or (
+            status == TeamStatus.PLAYING.value and t.deadline_at is not None and now >= t.deadline_at)
+        if expired:
+            status = TeamStatus.ELIMINATED.value
+        members = by_team[t.id]
+        names = {m.id: m.display_name for m in members}
+        leases = runtime.leases.active_for_team(t.id, now) if game.status == GameStatus.RUNNING.value else []
+        floor = floor_rows[t.id].get(t.current_floor)
+        preset = runtime.content.presets.get(floor.preset_id) if floor else None
+        solved = solved_rows.get((t.id, t.current_floor), set()) - {pr.VAULT_ID}
+        room = task = None
+        investigating: list[dict[str, Any]] = []
+        required_total = required_solved = 0
+        if preset is not None:
+            labels = {o["id"]: o["label"] for o in preset["objects"]}
+            required = [o for o in preset["objects"] if not pr.is_optional(o)]
+            required_total, required_solved = len(required), sum(1 for o in required if o["id"] in solved)
+            room = {"title": preset["title"], "preset_id": preset["id"], "floor_status": floor.status}
+            if floor.status == FloorStatus.COMPLETED.value:
+                task = "Floor complete: fragment collected" if floor.fragment_awarded else "Floor complete"
+            else:
+                target = pr.current_objective(preset, solved)
+                task = (preset["vault"]["label"] if target == pr.VAULT_ID else labels.get(target)) if target else None
+            investigating = [
+                {"object_id": l.object_id, "label": labels.get(l.object_id, l.object_id), "player": names.get(l.player_id)}
+                for l in leases if l.object_id in labels
+            ]
+        fragments = [bool(floor_rows[t.id].get(n) and floor_rows[t.id][n].fragment_awarded) for n in range(1, pr.TOTAL_FLOORS + 1)]
+        all_frags = all(fragments)
+        if status == TeamStatus.ESCAPED.value:
+            where = f"Floor {t.current_floor} -> escaped through the final door"
+        elif status == TeamStatus.ELIMINATED.value:
+            where = f"Floor {t.current_floor} -> out of time"
+        elif room is None:
+            where = f"Floor {t.current_floor}"
+        elif all_frags and t.current_floor == pr.TOTAL_FLOORS and floor.status == FloorStatus.COMPLETED.value:
+            where = f"Floor {t.current_floor} -> {room['title']} -> at the final door"
+        elif floor.status == FloorStatus.COMPLETED.value:
+            where = f"Floor {t.current_floor} -> {room['title']} -> ready to climb"
+        else:
+            doing = investigating[0]["label"] if investigating else (task or "searching")
+            verb = "investigating" if investigating else "next"
+            where = f"Floor {t.current_floor} -> {room['title']} -> {doing} ({verb})"
+        elapsed = None
+        if started is not None:
+            end = (t.finished_at if t.finished_at is not None else now)
+            elapsed = max(0, int((end - started).total_seconds()) - paused_total)
         rows.append({
-            "team_id": t.id, "name": t.name or f"Team {t.slot_no}", "status": TeamStatus.ELIMINATED.value if expired else t.status,
+            "team_id": t.id, "name": _clean_name(t), "icon": t.icon, "status": status,
+            "leader": next((m.display_name for m in members if m.id == t.leader_player_id), None),
+            "members": [{"name": m.display_name, "pawn_color": m.pawn_color, "connected": m.is_connected,
+                         "is_leader": m.id == t.leader_player_id} for m in members],
+            "players": len(members), "connected": sum(1 for m in members if m.is_connected),
             "floor": t.current_floor, "floors_completed": t.floors_completed,
-            "fragments": fragment_counts.get(t.id, 0), "hints_used": hint_counts.get(t.id, 0),
-            "players": members.get(t.id, 0),
-            "seconds_remaining": seconds_remaining(t.deadline_at, now) if (t.deadline_at and not expired) else 0,
+            "room": room, "task": task, "investigating": investigating, "where": where,
+            "required_solved": required_solved, "required_total": required_total,
+            "fragments": sum(fragments), "fragment_flags": fragments,
+            "at_final_door": bool(all_frags and status == TeamStatus.PLAYING.value),
+            "hints_used": hint_counts.get(t.id, 0), "hints_remaining": max(0, max_hints - hint_counts.get(t.id, 0)),
+            "penalty_seconds": t.hint_penalty_seconds,
+            "deadline_at": _iso(t.deadline_at),
+            "seconds_remaining": seconds_remaining(t.deadline_at, now) if (t.deadline_at and not expired and status == TeamStatus.PLAYING.value) else 0,
+            "elapsed_seconds": elapsed,
             "finished_at": _iso(t.finished_at),
         })
-    winner = next((r for r in rows if r["team_id"] == game.winner_team_id), None)
+    winner_row = next((r for r in rows if r["team_id"] == game.winner_team_id), None)
+    winner = None
+    if winner_row:
+        winner = {"team_name": winner_row["name"], "team_id": winner_row["team_id"],
+                  "completion_seconds": winner_row["elapsed_seconds"], "finished_at": winner_row["finished_at"]}
+
+    events = db.execute(
+        select(GameEvent, Team).outerjoin(Team, Team.id == GameEvent.team_id)
+        .where(GameEvent.game_id == game.id, GameEvent.event_type.in_(list(_FEED_TEXT)))
+        .order_by(GameEvent.created_at.desc(), GameEvent.id.desc()).limit(30)
+    ).all()
+    feed = [{
+        "type": ev.event_type, "at": _iso(ev.created_at), "team": _clean_name(team), "text": _FEED_TEXT[ev.event_type],
+        "detail": {k: v for k, v in (ev.payload or {}).items() if k in _FEED_KEYS},
+    } for ev, team in events]
+    db.commit()  # reads are done: hand the connection back now
     return {
-        "game_status": game.status, "server_now": _iso(now), "total_floors": pr.TOTAL_FLOORS,
-        "winner": {"team_name": winner["name"], "team_id": winner["team_id"]} if winner else None,
-        "teams": rows,
+        "game_status": game.status, "paused": paused, "paused_at": _iso(game.paused_at),
+        "paused_seconds_total": paused_total,
+        "server_now": _iso(real_now), "started_at": _iso(game.started_at), "ended_at": _iso(game.ended_at),
+        "base_duration_seconds": game.base_duration_seconds, "total_floors": pr.TOTAL_FLOORS,
+        "players": {"total": len(players), "connected": sum(1 for p in players if p.is_connected)},
+        "winner": winner, "teams": rows, "feed": feed,
     }

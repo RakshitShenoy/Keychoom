@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     secret_key: str = DEFAULT_DEV_SECRET
     content_dir: Path = APP_DIR / "content"
 
+    # --- database connection pool (must cover the ~40 web worker threads; see app/db/base.py) ---
+    db_pool_size: int = Field(50, ge=5)
+    db_max_overflow: int = Field(50, ge=0)
+    db_pool_timeout_seconds: float = Field(30, ge=1)
+
     # --- cookies -----------------------------------------------------------
     cookie_secure: bool = False
     cookie_samesite: Literal["lax", "strict", "none"] = "lax"
@@ -72,6 +77,11 @@ class Settings(BaseSettings):
 
     # --- WebSocket layer (Phase 3) ---------------------------------------------------
     ws_snapshot_debounce_seconds: float = Field(0.05, ge=0)  # coalesces bursts of changes
+    # Every change rebuilds a personal snapshot for EVERY connected client (~0.4s of CPU at 250 clients).
+    # The wait before a push therefore grows with the number of connections: bursts collapse into
+    # one push instead of saturating the server. 250 clients -> about 2 seconds.
+    ws_snapshot_cost_per_connection_seconds: float = Field(0.008, ge=0)
+    ws_dashboard_debounce_seconds: float = Field(0.25, ge=0)  # coalesces host-dashboard pushes
     ws_max_message_bytes: int = Field(4096, ge=64)
     ws_send_queue_size: int = Field(200, ge=10)
     ws_state_request_limit: int = Field(5, ge=1)  # REQUEST_STATE messages per window

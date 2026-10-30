@@ -80,3 +80,32 @@ def test_phase2_migration_backfills_team_count_and_round_trips(tmp_path):
     with engine.connect() as connection:
         assert connection.execute(text("SELECT count(*) FROM games")).scalar() == 1
     engine.dispose()
+
+
+def test_phase10_migration_is_additive_and_round_trips(tmp_path):
+    """0003 adds the pause columns without touching existing games (paused_seconds_total backfills to 0)."""
+    from sqlalchemy import text
+
+    url = f"sqlite:///{tmp_path / 'phase10.db'}"
+    cfg = alembic_config(url)
+    command.upgrade(cfg, "0002")
+    engine = create_engine(url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO games (id, game_code, status, host_token_hash, host_session_expires_at,"
+                " min_teams, max_teams, min_players_per_team, max_players_per_team,"
+                " base_duration_seconds, team_count, created_at)"
+                " VALUES ('g1', 'ABC234', 'RUNNING', 'h', '2026-01-01 00:00:00', 3, 7, 3, 5, 3600, 4,"
+                " '2026-01-01 00:00:00')"
+            )
+        )
+    command.upgrade(cfg, "head")
+    with engine.connect() as connection:
+        row = connection.execute(text("SELECT status, paused_at, paused_seconds_total FROM games")).one()
+        assert (row.status, row.paused_at, row.paused_seconds_total) == ("RUNNING", None, 0)
+    command.downgrade(cfg, "0002")
+    command.upgrade(cfg, "head")
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT count(*) FROM games")).scalar() == 1
+    engine.dispose()

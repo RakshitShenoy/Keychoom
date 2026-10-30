@@ -204,7 +204,7 @@
     $("hh-stage").className = "hh-stage floor-" + (room ? room.floor : 1);
 
     section("hud", sig([room && room.floor, state.team, state.fragments, state.hints.remaining, state.hints.max, state.progress,
-      state.timer.deadline_at, state.timer.expired, connection, fx(), soundOn(), state.game.status]), hudBlock);
+      state.timer.deadline_at, state.timer.expired, state.timer.paused, connection, fx(), soundOn(), state.game.status]), hudBlock);
     section("msg", sig(message), function () { return message ? el("div", { class: "hh-msg " + message.kind, text: message.text }) : null; });
     if (!room) { return; }
     $("hh-roomtitle").textContent = room.title;
@@ -478,6 +478,12 @@
         el("button", { type: "button", text: "See the house", onclick: function () { sigs.cover = "dismissed"; $("hh-cover").textContent = ""; } })
       ])]);
     }
+    if (g.paused) {  // the host paused: the server rejects every action until it resumes
+      return el("div", { class: "hh-cover", id: "hh-paused", role: "alertdialog", "aria-label": "Game paused" }, [el("div", { class: "box" }, [
+        el("h2", { text: "The house holds its breath" }),
+        el("p", { text: "The host paused the game. Your clock is stopped. Nothing can be solved until it resumes." })
+      ])]);
+    }
     if (state.timer.expired || state.team.status === "ELIMINATED") {
       return el("div", { class: "hh-cover", id: "hh-timeup", role: "dialog", "aria-label": "Time is up" }, [el("div", { class: "box" }, [
         el("h2", { text: "Time is up" }), el("p", { text: "The clock struck midnight. Your team can no longer escape." }),
@@ -492,12 +498,14 @@
     if (!state || !state.timer) { return; }
     const clock = $("hh-clock");
     if (clock && state.timer.deadline_at) {
-      const left = (Date.parse(state.timer.deadline_at) - nowServerMs()) / 1000;
+      const left = state.timer.paused && state.timer.seconds_remaining !== null
+        ? state.timer.seconds_remaining  // frozen by the host's pause (the server computed it)
+        : (Date.parse(state.timer.deadline_at) - nowServerMs()) / 1000;
       clock.textContent = state.timer.expired || state.game.status === "FINISHED" ? "0:00" : fmt(left);
-      if (!state.timer.expired && left <= 0 && state.game.status === "RUNNING" && !tick.asked) { tick.asked = true; setTimeout(function () { tick.asked = false; refresh(true); }, 1500); }
+      if (!state.timer.expired && !state.timer.paused && left <= 0 && state.game.status === "RUNNING" && !tick.asked) { tick.asked = true; setTimeout(function () { tick.asked = false; refresh(true); }, 1500); }
     }
     const qc = $("gm-quizclock");
-    if (qc) { qc.textContent = fmt((Date.parse(qc.getAttribute("data-ends")) - nowServerMs()) / 1000); }
+    if (qc && !state.timer.paused) { qc.textContent = fmt((Date.parse(qc.getAttribute("data-ends")) - nowServerMs()) / 1000); }
     if (cooldownUntil && Date.now() > cooldownUntil) { cooldownUntil = 0; sigs.task = null; sigs.vault = null; sigs.door = null; render(); }
   }
 

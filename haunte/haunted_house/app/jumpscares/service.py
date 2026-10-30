@@ -109,7 +109,8 @@ def fire_due(db: Session, runtime: "GameRuntime", now: datetime) -> int:
             team = db.get(Team, team_id, populate_existing=True)
             game = db.get(Game, team.game_id, populate_existing=True) if team else None
             if (event is None or event.fired_at is not None or team is None or game is None
-                    or game.status != GameStatus.RUNNING.value or team.status != TeamStatus.PLAYING.value):
+                    or game.status != GameStatus.RUNNING.value or game.paused_at is not None
+                    or team.status != TeamStatus.PLAYING.value):
                 continue
             last = _last_fired(db, team.id)
             if last is not None and now < last + timedelta(seconds=settings.jumpscare_cooldown_seconds):

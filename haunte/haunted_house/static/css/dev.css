@@ -77,3 +77,35 @@ ul#activity { list-style: none; padding: 0; margin: 8px 0 0; font-size: .85rem; 
 .gm-prompt { font-size: 1.05rem; }
 .gm-inv { border-color: #f77f00; }
 .gm-hintrow { justify-content: space-between; }
+
+/* --- Phase 10: host dashboard --- */
+.dash-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.dash-head h2 { margin: 0; }
+.badge.dash-RUNNING { background: #1f6f43; }
+.badge.dash-PAUSED { background: #b5179e; }
+.badge.dash-FINISHED { background: #3a2150; }
+.badge.PLAYING { background: #1f6f43; }
+.badge.ESCAPED { background: #b8860b; color: #fff; }
+.badge.ELIMINATED { background: #8b1e1e; }
+.dash-clocks { margin: 8px 0; font-size: 1.1rem; }
+.scroll { overflow-x: auto; }
+.tower { display: flex; flex-direction: column; gap: 4px; }
+.tower-row { display: grid; grid-template-columns: 72px 1fr; gap: 10px; align-items: start; padding: 6px 8px; border-left: 3px solid #4a2d63; background: #12091a; border-radius: 0 6px 6px 0; }
+.tower-row.top { border-left-color: #fcbf49; }
+.tower-floor { color: #bfa9c9; font-family: Georgia, serif; }
+.tower-teams { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { position: relative; display: inline-block; padding: 3px 10px 6px; border-radius: 12px; background: #2a1a38; border: 1px solid #4a2d63; font-size: .85rem; overflow: hidden; }
+.chip i { position: absolute; left: 0; bottom: 0; height: 3px; background: #80ed99; }
+.chip.ELIMINATED { opacity: .5; border-color: #8b1e1e; text-decoration: line-through; }
+.chip.ESCAPED { background: #7a5a00; border-color: #fcbf49; }
+.chip.door { border-color: #fcbf49; box-shadow: 0 0 8px #fcbf4966; }
+.dash-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
+.dash-card-team h4 { margin: 0 0 4px; color: #fcbf49; font-family: Georgia, serif; }
+.dash-card-team .where { margin: 6px 0; color: #e8dfe9; }
+.dash-card-team .frags { display: flex; gap: 3px; margin: 6px 0; }
+.dash-card-team .frags span { width: 22px; height: 22px; display: grid; place-items: center; border-radius: 50%; background: #2a1a38; color: #8a7596; font-size: .75rem; }
+.dash-card-team .frags span.got { background: #1f6f43; color: #fff; }
+.member { display: inline-block; margin: 2px 8px 0 0; font-size: .85rem; }
+.member.off { opacity: .45; }
+.dash-feed { list-style: none; padding: 0; margin: 0; font-size: .9rem; }
+.dash-feed li { padding: 2px 0; border-bottom: 1px solid #2a1a38; }

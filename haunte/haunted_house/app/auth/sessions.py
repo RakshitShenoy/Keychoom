@@ -16,14 +16,18 @@ if TYPE_CHECKING:
 
 
 def set_session_cookie(
-    response: Response, settings: "Settings", name: str, token: str, max_age_seconds: int
+    response: Response, settings: "Settings", name: str, token: str, max_age_seconds: int,
+    request_is_https: bool = False,
 ) -> None:
+    """``Secure`` is set when COOKIE_SECURE=true OR the request really arrived over HTTPS. Behind a
+    proxy (Replit) uvicorn's --proxy-headers makes the scheme follow X-Forwarded-Proto, so a deployment
+    can never silently hand out non-Secure session cookies just because the variable was forgotten."""
     response.set_cookie(
         key=name,
         value=token,
         max_age=max_age_seconds,
         httponly=True,  # not readable from JavaScript
-        secure=settings.cookie_secure,
+        secure=settings.cookie_secure or request_is_https,
         samesite=settings.cookie_samesite,
         path="/",
     )

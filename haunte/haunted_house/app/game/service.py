@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable
 
 from sqlalchemy import select
@@ -36,7 +36,7 @@ from app.lobby.events import LobbyEvent, LobbyEventBus, LobbyEventType, record_e
 from app.lobby.locks import game_lock
 from app.teams.queries import load_lobby_data
 from app.timers.clock import utcnow
-from app.timers.deadline import compute_team_deadline
+from app.timers.deadline import compute_team_deadline, team_deadline_for
 
 log = logging.getLogger(__name__)
 E = LobbyEventType
@@ -123,6 +123,8 @@ def _require_running(game: Game) -> None:
         raise AppError(409, "GAME_OVER", "The game is over.")
     if game.status != GameStatus.RUNNING.value:
         raise AppError(409, "GAME_NOT_RUNNING", "The game is not running.")
+    if game.paused_at is not None:  # Phase 10: the host paused the game; nothing may change
+        raise AppError(409, "GAME_PAUSED", "The host has paused the game.")
 
 
 def _eliminate(db: Session, runtime: GameRuntime, ctx: Ctx) -> None:
@@ -599,6 +601,8 @@ def open_final_door(
             game = db.scalar(select(Game).where(Game.id == ctx.game.id).execution_options(populate_existing=True))
             if game is None or game.status != GameStatus.RUNNING.value:
                 raise AppError(409, "GAME_OVER", "Another team has already escaped.")
+            if game.paused_at is not None:
+                raise AppError(409, "GAME_PAUSED", "The host has paused the game.")
             team = ctx.team
             ctx.game = game
             game.status = GameStatus.FINISHED.value
@@ -813,7 +817,7 @@ def use_hint(
             raise AppError(409, "NO_HINT_AVAILABLE", "There is nothing left to hint at.")
         penalty = penalty_for_hint(level, settings.hint_penalty_schedule)
         total = ctx.team.hint_penalty_seconds + penalty
-        new_deadline = compute_team_deadline(ctx.game.started_at, ctx.game.base_duration_seconds, total)
+        new_deadline = team_deadline_for(ctx.game, total)
         if new_deadline <= now:
             raise AppError(409, "NOT_ENOUGH_TIME", "Your team does not have enough time left for that hint.")
 
@@ -844,6 +848,83 @@ def use_hint(
 
 
 # =====================================================================================
+# Phase 10: the host pauses and resumes the game
+# =====================================================================================
+def _lock_all_teams(db: Session, runtime: GameRuntime, game_id: str):
+    """Lock order is always: team locks (sorted by id) first, then the game lock. A final-door
+    attempt takes one team lock and then the game lock, so the orders never conflict."""
+    from contextlib import ExitStack
+
+    stack = ExitStack()
+    for team_id in sorted(db.scalars(select(Team.id).where(Team.game_id == game_id)).all()):
+        stack.enter_context(runtime.team_lock(team_id))
+    return stack
+
+
+def pause_game(db: Session, runtime: GameRuntime, game_id: str, now: datetime | None = None) -> Game:
+    """Freeze every clock. The pause is a stored fact (``games.paused_at``), enforced by the server on
+    every gameplay action and by the sweeper; it is not just a banner in the browser."""
+    now = now or utcnow()
+    with _lock_all_teams(db, runtime, game_id), game_lock:
+        game = db.scalar(select(Game).where(Game.id == game_id).execution_options(populate_existing=True))
+        if game is None:
+            raise AppError(404, "GAME_NOT_FOUND", "No game exists with that code.")
+        if game.status != GameStatus.RUNNING.value:
+            raise AppError(409, "GAME_NOT_RUNNING", "Only a running game can be paused.")
+        if game.paused_at is not None:
+            raise AppError(409, "ALREADY_PAUSED", "The game is already paused.")
+        game.paused_at = now
+        event = record_event(db, game.id, E.GAME_PAUSED, {"paused_at": now.isoformat()})
+        db.commit()
+        team_ids = list(db.scalars(select(Team.id).where(Team.game_id == game.id)).all())
+    runtime.bus.publish_change(event)
+    for team_id in team_ids:
+        runtime.bus.publish(LobbyEvent(E.FLOOR_UPDATED, game.id, {}, team_id))
+    return game
+
+
+def resume_game(db: Session, runtime: GameRuntime, game_id: str, now: datetime | None = None) -> Game:
+    """Unfreeze: every team keeps exactly the time it had when the pause began."""
+    from app.db.models import JumpscareEvent
+
+    now = now or utcnow()
+    with _lock_all_teams(db, runtime, game_id), game_lock:
+        game = db.scalar(select(Game).where(Game.id == game_id).execution_options(populate_existing=True))
+        if game is None:
+            raise AppError(404, "GAME_NOT_FOUND", "No game exists with that code.")
+        if game.status != GameStatus.RUNNING.value or game.paused_at is None:
+            raise AppError(409, "NOT_PAUSED", "The game is not paused.")
+        delta = max(timedelta(0), now - game.paused_at)
+        seconds = int(round(delta.total_seconds()))
+        teams = list(db.scalars(
+            select(Team).where(Team.game_id == game.id).execution_options(populate_existing=True)
+        ).all())
+        team_ids = [t.id for t in teams]
+        for team in teams:
+            if team.status == TeamStatus.PLAYING.value and team.deadline_at is not None:
+                team.deadline_at = team.deadline_at + delta
+        for attempt in db.scalars(
+            select(QuizAttempt).where(QuizAttempt.team_id.in_(team_ids), QuizAttempt.submitted_at.is_(None))
+            .execution_options(populate_existing=True)
+        ).all():
+            attempt.ends_at = attempt.ends_at + delta
+        for scare in db.scalars(
+            select(JumpscareEvent).where(JumpscareEvent.team_id.in_(team_ids), JumpscareEvent.fired_at.is_(None))
+            .execution_options(populate_existing=True)
+        ).all():
+            scare.scheduled_at = scare.scheduled_at + delta
+        runtime.leases.shift_teams(set(team_ids), delta)
+        game.paused_seconds_total = int(game.paused_seconds_total or 0) + seconds
+        game.paused_at = None
+        event = record_event(db, game.id, E.GAME_RESUMED, {"paused_seconds": seconds})
+        db.commit()
+    runtime.bus.publish_change(event)
+    for team_id in team_ids:
+        runtime.bus.publish(LobbyEvent(E.FLOOR_UPDATED, game.id, {}, team_id))
+    return game
+
+
+# =====================================================================================
 # Phase 6: expiry (also used by the background sweeper)
 # =====================================================================================
 def _ctx_for_team(db: Session, runtime: GameRuntime, team_id: str, now: datetime) -> Ctx | None:
@@ -851,8 +932,8 @@ def _ctx_for_team(db: Session, runtime: GameRuntime, team_id: str, now: datetime
     if team is None:
         return None
     game = db.scalar(select(Game).where(Game.id == team.game_id).execution_options(populate_existing=True))
-    if game is None or game.status != GameStatus.RUNNING.value:
-        return None
+    if game is None or game.status != GameStatus.RUNNING.value or game.paused_at is not None:
+        return None  # not running, or paused: the sweeper must not touch a frozen game
     try:
         return _build_ctx(db, runtime, game, team, now)
     except AppError:
@@ -882,7 +963,10 @@ def eliminate_overdue_teams(db: Session, runtime: GameRuntime, now: datetime | N
 
 def _sweep_leases(db: Session, runtime: GameRuntime, now: datetime) -> int:
     count = 0
-    for lease in runtime.leases.expire(now):
+    paused_teams = set(db.scalars(
+        select(Team.id).join(Game, Game.id == Team.game_id).where(Game.paused_at.is_not(None))
+    ).all())
+    for lease in runtime.leases.expire(now, paused_teams):
         with runtime.team_lock(lease.team_id):
             ctx = _ctx_for_team(db, runtime, lease.team_id, now)
             obj = ctx.objects.get(lease.object_id) if ctx else None

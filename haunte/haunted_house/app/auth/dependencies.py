@@ -9,11 +9,20 @@ from app.db.session import get_db
 from app.errors import AppError
 
 
+def _release_connection(db: Session) -> None:
+    """End the read-only transaction opened by the session lookup so the database connection goes
+    back to the pool while the request waits for its worker thread. Sessions are configured with
+    expire_on_commit=False, so the loaded Game/Player objects stay usable and later queries simply
+    begin a new transaction."""
+    db.commit()
+
+
 def require_host(request: Request, db: Session = Depends(get_db)) -> Game:
     settings = request.app.state.settings
     game = resolve_host_game(db, settings, request.cookies.get(settings.host_cookie_name))
     if game is None:
         raise AppError(401, "HOST_SESSION_REQUIRED", "A valid host session is required.")
+    _release_connection(db)
     return game
 
 
@@ -22,6 +31,7 @@ def require_player(request: Request, db: Session = Depends(get_db)) -> Player:
     player = resolve_player(db, settings, request.cookies.get(settings.player_cookie_name))
     if player is None:
         raise AppError(401, "PLAYER_SESSION_REQUIRED", "A valid player session is required.")
+    _release_connection(db)
     return player
 
 
@@ -45,6 +55,7 @@ def require_host_of_game(
         raise AppError(401, "HOST_SESSION_REQUIRED", "A valid host session is required.")
     if host_game.game_code != code:
         raise AppError(403, "WRONG_GAME", "You do not have access to that game.")
+    _release_connection(db)
     return host_game
 
 
@@ -58,6 +69,7 @@ def require_player_of_game(
         raise AppError(401, "PLAYER_SESSION_REQUIRED", "A valid player session is required.")
     if player.game.game_code != code:
         raise AppError(403, "WRONG_GAME", "You do not have access to that game.")
+    _release_connection(db)
     return player
 
 
@@ -91,4 +103,6 @@ def identify_viewer(
 
 def lobby_viewer(game_code: str, request: Request, db: Session = Depends(get_db)) -> LobbyViewer:
     """Host or player of THIS game; anyone else is refused."""
-    return identify_viewer(db, request.app.state.settings, request.cookies, game_code)
+    viewer = identify_viewer(db, request.app.state.settings, request.cookies, game_code)
+    _release_connection(db)
+    return viewer

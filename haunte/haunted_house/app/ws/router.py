@@ -17,7 +17,7 @@ from app.ws.hub import KICKED_ERROR, NOT_AUTHORIZED_ERROR, RealtimeHub, SocketId
 from app.ws.manager import Connection
 from app.ws.protocol import (
     CLOSE_FORBIDDEN, CLOSE_HEARTBEAT, CLOSE_UNAUTHENTICATED,
-    error_message, floor_state_message, ping_message, pong_message, state_message,
+    dashboard_message, error_message, floor_state_message, ping_message, pong_message, state_message,
 )
 
 log = logging.getLogger(__name__)
@@ -69,6 +69,10 @@ async def _send_state(hub: RealtimeHub, conn: Connection, identity: SocketIdenti
     version, payload, team_id = snapshot
     conn.team_id = team_id
     conn.send(state_message(version, payload))
+    if identity.role == "host":  # the host's whole-game overview (nobody else ever gets it)
+        dashboard = await run_in_threadpool(hub.dashboard_for, identity.game_id)
+        if dashboard is not None:
+            conn.send(dashboard_message(*dashboard))
     if team_id is not None:  # Phase 4: the team's private floor view follows the lobby state
         floor = await run_in_threadpool(hub.floor_state_for, identity.game_id, identity.player_id)
         if floor is not None:
@@ -165,13 +169,17 @@ async def game_socket(websocket: WebSocket, game_code: str) -> None:
     limiter = FailureLimiter(settings.ws_state_request_limit, settings.ws_state_request_window_seconds)
     tasks: list[asyncio.Task] = []
     try:
+        # The writer starts BEFORE anything is queued: a registered connection whose writer is not
+        # running yet cannot drain, so a burst of other players connecting used to overflow its queue
+        # and get it dropped as TOO_SLOW before it had even received its first message.
+        writer_task = asyncio.create_task(_writer(websocket, conn))
+        tasks.append(writer_task)
         # Registered first, THEN the snapshot is read: nothing that happens in between is missed.
         await _send_state(hub, conn, identity)
         if first_for_player and identity.player_id:
             await run_in_threadpool(hub.set_presence, identity.game_id, identity.player_id, True)
 
-        tasks = [
-            asyncio.create_task(_writer(websocket, conn)),
+        tasks += [
             asyncio.create_task(_reader(websocket, conn, hub, identity, limiter)),
             asyncio.create_task(_heartbeat(conn, settings)),
         ]

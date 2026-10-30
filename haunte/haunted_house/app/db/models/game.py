@@ -42,6 +42,12 @@ class Game(Base):
     team_formation_started_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
     team_formation_locked_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
 
+    # Phase 10: host pause. While ``paused_at`` is set every clock is frozen; on resume all team
+    # deadlines move forward by the pause length and ``paused_seconds_total`` keeps the sum, so a
+    # deadline recomputed later (a hint) still includes every pause.
+    paused_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    paused_seconds_total: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+
     # Intentionally no FK yet: games <-> teams would be a circular dependency.
     # The constraint is added together with the winner logic (Phase 2+).
     winner_team_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -64,4 +70,5 @@ class Game(Base):
         CheckConstraint(
             "team_count >= min_teams AND team_count <= max_teams", name="team_count_bounds"
         ),
+        CheckConstraint("paused_seconds_total >= 0", name="paused_total_nonnegative"),
     )

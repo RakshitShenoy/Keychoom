@@ -19,10 +19,20 @@ class Base(DeclarativeBase):
     metadata = MetaData(naming_convention=NAMING_CONVENTION)
 
 
-def make_engine(url: str) -> Engine:
+def make_engine(
+    url: str, pool_size: int = 50, max_overflow: int = 50, pool_timeout: float = 30
+) -> Engine:
+    """Connection pool sized for the web server's worker threads.
+
+    SQLAlchemy's default (5 + 10 connections) is smaller than the 40 threads FastAPI uses for
+    synchronous endpoints, so a burst of players made requests wait for a connection until they
+    timed out with HTTP 500 (a 502 behind a proxy). The pool must be at least as large as the thread pool.
+    """
     is_sqlite = url.startswith("sqlite")
     connect_args = {"check_same_thread": False, "timeout": 30} if is_sqlite else {}
-    engine = create_engine(url, connect_args=connect_args, pool_pre_ping=not is_sqlite)
+    pool_args = {} if ":memory:" in url else {
+        "pool_size": pool_size, "max_overflow": max_overflow, "pool_timeout": pool_timeout}
+    engine = create_engine(url, connect_args=connect_args, pool_pre_ping=not is_sqlite, **pool_args)
 
     if is_sqlite:
 

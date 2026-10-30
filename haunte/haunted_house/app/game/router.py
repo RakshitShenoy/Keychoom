@@ -159,6 +159,24 @@ def final_door(
     return service.open_final_door(db, _runtime(request), player, payload.code)
 
 
+@router.post("/pause")
+def pause(
+    request: Request, payload: EmptyRequest | None = None,
+    game: Game = Depends(require_host_of_game), db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    game = service.pause_game(db, _runtime(request), game.id)
+    return build_host_dashboard(db, _runtime(request), game)
+
+
+@router.post("/resume")
+def resume(
+    request: Request, payload: EmptyRequest | None = None,
+    game: Game = Depends(require_host_of_game), db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    game = service.resume_game(db, _runtime(request), game.id)
+    return build_host_dashboard(db, _runtime(request), game)
+
+
 @router.get("/play/host")
 def host_dashboard(
     request: Request, game: Game = Depends(require_host_of_game), db: Session = Depends(get_db),

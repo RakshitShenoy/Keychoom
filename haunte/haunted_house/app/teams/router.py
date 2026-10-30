@@ -101,7 +101,16 @@ def kick_player(
     game: Game = Depends(require_host_of_game),
     db: Session = Depends(get_db),
 ) -> LobbyResponse:
+    target = db.scalar(select(Player).where(Player.id == player_id, Player.game_id == game.id))
+    team_id = target.team_id if target is not None else None
     remove_player(db, request.app.state.lobby_bus, game.id, player_id, kicked=True)
+    if target is not None and game.status == "RUNNING":
+        # a removed player must not keep a puzzle locked for their team
+        runtime = request.app.state.game
+        runtime.leases.release_player(player_id)
+        if team_id:
+            from app.lobby.events import LobbyEvent, LobbyEventType
+            request.app.state.lobby_bus.publish(LobbyEvent(LobbyEventType.FLOOR_UPDATED, game.id, {}, team_id))
     return _host_view(db, request, game)
 
 

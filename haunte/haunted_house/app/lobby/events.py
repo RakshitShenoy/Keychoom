@@ -60,6 +60,9 @@ class LobbyEventType(str, Enum):
     GAME_FINISHED = "GAME_FINISHED"
     JUMPSCARE = "JUMPSCARE"
     TRAP_TRIGGERED = "TRAP_TRIGGERED"
+    # --- Phase 10: host pause. Game-wide: every team and the host hear it at once.
+    GAME_PAUSED = "GAME_PAUSED"
+    GAME_RESUMED = "GAME_RESUMED"
 
 
 @dataclass(frozen=True)

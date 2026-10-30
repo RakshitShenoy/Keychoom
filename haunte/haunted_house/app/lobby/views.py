@@ -132,6 +132,7 @@ def build_lobby_view(
         )
         actions = None
 
+    db.commit()  # reads are done: hand the connection back now (see app/db/session.py)
     return LobbyResponse(
         game_code=game.game_code,
         lobby_state=lobby_state_name(game),

@@ -18,6 +18,7 @@
     let fatal = false;
     let lastVersion = -1;
     let lastFloorVersion = -1;
+    let lastDashVersion = -1;
     let retryTimer = null;
     let pollTimer = null;
 
@@ -50,6 +51,12 @@
           lastFloorVersion = msg.version;
         }
         if (opts.onFloorState) { opts.onFloorState(msg.payload); }
+      } else if (msg.type === "HOST_DASHBOARD") {
+        if (typeof msg.version === "number") {
+          if (msg.version < lastDashVersion) { return; }
+          lastDashVersion = msg.version;
+        }
+        if (opts.onDashboard) { opts.onDashboard(msg.payload); }
       } else if (msg.type === "PING") {
         send({ type: "PONG" });
       } else if (msg.type === "PONG") {
@@ -80,6 +87,7 @@
       try { ws = new WebSocket(url()); } catch (e) { scheduleReconnect(); return; }
       lastVersion = -1;                                   // versions restart per connection
       lastFloorVersion = -1;
+      lastDashVersion = -1;
       ws.onopen = function () { attempts = 0; stopPolling(); status("live"); };
       ws.onmessage = function (event) {
         let msg = null;
@@ -160,6 +168,10 @@
       case "FINAL_DOOR_OPENED": return team + " opened the final door!";
       case "GAME_FINISHED": return p.winner_team_name ? p.winner_team_name + " escaped first!" : "Time ran out for every team";
       case "JUMPSCARE": return null;      // shown as an overlay by the game view
+      case "GAME_PAUSED": return "The game was paused";
+      case "GAME_RESUMED": return "The game resumed";
+      case "TEAM_ELIMINATED": return team + " ran out of time";
+      case "FINAL_DOOR_OPENED": return team + " opened the final door";
       case "CHAT_MESSAGE": return null;   // shown in the chat box itself
       default: return null;               // TEAM_UPDATED / LOBBY_UPDATED: state already re-rendered
     }

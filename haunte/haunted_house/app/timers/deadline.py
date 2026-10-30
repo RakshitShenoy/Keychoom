@@ -48,3 +48,15 @@ def compute_team_deadline(
     if hint_penalty_seconds < 0:
         raise ValueError("hint_penalty_seconds must not be negative")
     return game_start + timedelta(seconds=base_duration_seconds - hint_penalty_seconds)
+
+
+def frozen_now(game, now: datetime) -> datetime:
+    """The clock the game currently runs on: frozen at the moment of the pause while paused."""
+    paused_at = getattr(game, "paused_at", None)
+    return paused_at if paused_at is not None else now
+
+
+def team_deadline_for(game, hint_penalty_seconds: int) -> datetime:
+    """Enforced deadline of a team: start + base - hint penalties + every pause so far."""
+    base = compute_team_deadline(game.started_at, game.base_duration_seconds, hint_penalty_seconds)
+    return base + timedelta(seconds=int(game.paused_seconds_total or 0))

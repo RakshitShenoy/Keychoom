@@ -22,7 +22,7 @@ from app.lobby.views import Viewer, build_lobby_view
 from app.teams.queries import load_lobby_data
 from app.ws.manager import ConnectionManager
 from app.ws.protocol import (
-    CLOSE_FORBIDDEN, CLOSE_NORMAL, error_message, event_message, floor_state_message,
+    CLOSE_FORBIDDEN, CLOSE_NORMAL, dashboard_message, error_message, event_message, floor_state_message,
     public_payload, state_message,
 )
 
@@ -32,6 +32,10 @@ if TYPE_CHECKING:
     from app.config import Settings
 
 log = logging.getLogger(__name__)
+
+# Sent as individual messages to the host only. With N players connecting at once, announcing each
+# one to every player is N*N messages; the players' own LOBBY_STATE already carries is_connected.
+PRESENCE_EVENTS = frozenset({LobbyEventType.PLAYER_CONNECTED, LobbyEventType.PLAYER_DISCONNECTED})
 
 KICKED_ERROR = ("KICKED", "You were removed from the game by the host.")
 NOT_AUTHORIZED_ERROR = ("NOT_AUTHORIZED", "You are not authorized to access this game.")
@@ -57,6 +61,7 @@ class RealtimeHub:
         self._timers: dict[str, threading.Timer] = {}
         self._closed = False
         self._floor_versions: dict[str, int] = {}
+        self._dash_versions: dict[str, int] = {}
         self.gameplay = None  # GameRuntime, attached by the application factory (Phase 4)
         bus.subscribe(self.on_event)
 
@@ -149,14 +154,17 @@ class RealtimeHub:
 
     def _schedule_snapshot(self, game_id: str) -> None:
         """Coalesce bursts: many changes within the debounce window produce one push."""
-        if not self.manager.connections(game_id):
+        listeners = len(self.manager.connections(game_id))
+        if not listeners:
             return  # nobody is listening: no need to read the database
+        delay = max(
+            self.settings.ws_snapshot_debounce_seconds,
+            listeners * self.settings.ws_snapshot_cost_per_connection_seconds,
+        )
         with self._lock:
             if self._closed or game_id in self._timers:
                 return
-            timer = threading.Timer(
-                self.settings.ws_snapshot_debounce_seconds, self._flush, args=(game_id,)
-            )
+            timer = threading.Timer(delay, self._flush, args=(game_id,))
             timer.daemon = True
             self._timers[game_id] = timer
         timer.start()
@@ -250,6 +258,57 @@ class RealtimeHub:
         except Exception:
             log.exception("floor snapshot push failed for team %s", team_id)
 
+    # ------------------------------------------------------------------ host dashboard (Phase 10)
+    def dashboard_for(self, game_id: str) -> tuple[int, dict[str, Any]] | None:
+        """The host's whole-game overview, or None before the game starts. Built from the database."""
+        if self.gameplay is None:
+            return None
+        from app.game.views import build_host_dashboard
+
+        with self._lock:
+            self._dash_versions[game_id] = self._dash_versions.get(game_id, 0) + 1
+            version = self._dash_versions[game_id]  # taken BEFORE reading: newer version => newer data
+        db = self.session_factory()
+        try:
+            game = db.get(Game, game_id, populate_existing=True)
+            if game is None or game.status not in ("RUNNING", "FINISHED"):
+                return None
+            return version, build_host_dashboard(db, self.gameplay, game)
+        finally:
+            db.close()
+
+    def push_dashboard(self, game_id: str) -> None:
+        """Send the dashboard to every HOST connection of the game (players never get it)."""
+        hosts = [c for c in self.manager.connections(game_id) if c.role == "host"]
+        if not hosts:
+            return
+        result = self.dashboard_for(game_id)
+        if result is None:
+            return
+        message = dashboard_message(*result)
+        for conn in hosts:
+            conn.send(message)
+
+    def _schedule_dashboard(self, game_id: str) -> None:
+        if self.gameplay is None or not any(c.role == "host" for c in self.manager.connections(game_id)):
+            return
+        key = f"dash:{game_id}"
+        with self._lock:
+            if self._closed or key in self._timers:
+                return
+            timer = threading.Timer(self.settings.ws_dashboard_debounce_seconds, self._flush_dashboard, args=(game_id, key))
+            timer.daemon = True
+            self._timers[key] = timer
+        timer.start()
+
+    def _flush_dashboard(self, game_id: str, key: str) -> None:
+        with self._lock:
+            self._timers.pop(key, None)
+        try:
+            self.push_dashboard(game_id)
+        except Exception:
+            log.exception("dashboard push failed for game %s", game_id)
+
     def _on_team_event(self, event: LobbyEvent) -> None:
         """Gameplay events reach the host and the ONE team they belong to; nobody else."""
         if event.type is LobbyEventType.JUMPSCARE:
@@ -265,6 +324,7 @@ class RealtimeHub:
             else:
                 self.manager.send_team(event.game_id, event.team_id, event_message(event.type.value, body))
             return
+        self._schedule_dashboard(event.game_id)
         if event.type is not LobbyEventType.FLOOR_UPDATED:
             name = event.type.value
             self.manager.send_game(
@@ -280,11 +340,14 @@ class RealtimeHub:
             return
         if event.type is LobbyEventType.LOBBY_UPDATED:
             self._schedule_snapshot(game_id)
+            self._schedule_dashboard(game_id)  # presence, pause, winner... all arrive as "state changed"
             return
 
         name = event.type.value
         # Hosts get the full payload; players get it without row ids.
         self.manager.send_game(game_id, event_message(name, dict(event.payload)), role="host")
+        if event.type in PRESENCE_EVENTS:
+            return  # "X connected" is host information; players see presence in their snapshots
         self.manager.send_game(
             game_id, event_message(name, public_payload(event.payload)), role="player"
         )

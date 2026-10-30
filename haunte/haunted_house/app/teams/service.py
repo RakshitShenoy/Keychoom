@@ -201,7 +201,9 @@ def remove_player(
                 409, "TEAM_FORMATION_LOCKED",
                 "Team formation is locked. Reopen it before removing players.",
             )
-        if game.status not in (GameStatus.LOBBY.value, GameStatus.TEAM_FORMATION.value):
+        in_lobby = game.status in (GameStatus.LOBBY.value, GameStatus.TEAM_FORMATION.value)
+        if not in_lobby and not (kicked and game.status == GameStatus.RUNNING.value):
+            # Phase 10: the host may still remove a player from a RUNNING game; players cannot leave it.
             raise AppError(409, "GAME_NOT_ACCEPTING_PLAYERS", "The game is no longer in the lobby.")
 
         player = _player_in_game(db, game, player_id)

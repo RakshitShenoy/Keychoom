@@ -17,6 +17,7 @@ from app.timers.clock import utcnow
 # Message types that are not lobby events
 LOBBY_STATE = "LOBBY_STATE"
 FLOOR_STATE = "FLOOR_STATE"  # a team's private floor view (Phase 4)
+HOST_DASHBOARD = "HOST_DASHBOARD"  # the whole-game overview, sent to HOST connections only (Phase 10)
 ERROR = "ERROR"
 PING = "PING"
 PONG = "PONG"
@@ -52,6 +53,10 @@ def state_message(version: int, lobby: dict[str, Any]) -> dict[str, Any]:
 
 def floor_state_message(version: int, state: dict[str, Any]) -> dict[str, Any]:
     return _envelope(FLOOR_STATE, version=version, payload=state)
+
+
+def dashboard_message(version: int, dashboard: dict[str, Any]) -> dict[str, Any]:
+    return _envelope(HOST_DASHBOARD, version=version, payload=dashboard)
 
 
 def error_message(code: str, message: str) -> dict[str, Any]:
